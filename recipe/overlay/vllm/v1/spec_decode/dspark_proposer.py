@@ -785,6 +785,30 @@ class DSparkProposer(SpecDecodeBaseProposer):
         total_started = time.perf_counter()
         batch_size = self._batch_size(next_token_ids)
 
+        # Non-uniform batch guard: mixed prefill/decode batches flatten to
+        # unequal per-request rows, which the uniform DSpark draft kernels
+        # cannot draft. Skip speculation for this step instead of raising and
+        # killing the WorkerProc.
+        hidden_rows = int(target_hidden_states.shape[0])
+        pos_rows = int(target_positions.reshape(-1).shape[0])
+        if batch_size > 0 and (
+            hidden_rows % batch_size != 0 or pos_rows % batch_size != 0
+        ):
+            if not getattr(self, "_nonuniform_step_warned", False):
+                logger.warning(
+                    "DSpark proposer: non-uniform flattened batch "
+                    "(%d hidden rows / %d positions for batch_size=%d); "
+                    "skipping speculation for this step. Further "
+                    "occurrences will not be logged.",
+                    hidden_rows,
+                    pos_rows,
+                    batch_size,
+                )
+                self._nonuniform_step_warned = True
+            return next_token_ids.new_zeros(
+                (batch_size, self.num_speculative_tokens)
+            )
+
         # Resolve the stable per-request KV slot for this step. The map is
         # always advanced (reclaim/assign) so it stays consistent across steps,
         # but when the resulting permutation is the identity we pass
