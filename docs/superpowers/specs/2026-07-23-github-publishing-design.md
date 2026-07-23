@@ -14,7 +14,9 @@ Publish the currently running two-node DeepSeek V4 Flash DSpark configuration as
 
 ## Published Content
 
-Publish the existing runtime recipes, scripts, patches, license, credits, README, and sanitized `.env.dspark.example`. Do not publish the active `.env.dspark`, model weights, caches, logs, keys, tokens, or machine credentials.
+Publish the existing runtime recipes, scripts, patches, license, credits, README, sanitized `.env.dspark.example`, and useful inherited benchmark source code and checkpoint Markdown that document upstream behavior and provenance. Preserve those useful benchmark materials when they are already part of upstream history.
+
+Do not publish generated benchmark results or output directories, local runtime captures, the active `.env.dspark`, model weights, caches, logs, credentials, keys, tokens, or machine-specific secrets.
 
 ## Validation
 

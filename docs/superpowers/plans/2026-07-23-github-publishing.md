@@ -4,7 +4,7 @@
 
 **Goal:** Publish the current two-node DeepSeek V4 Flash DSpark configuration as the public standalone repository `binhdnguyen/DeepSeek-V4-Flash-DSpark-2x-DGX-Spark`.
 
-**Architecture:** Preserve the existing MiaAI-Lab history, create a local `main` branch, retain the original repository as `upstream`, and publish the customized branch to a new `origin`. Only tracked reusable configuration is published; active environment files, credentials, caches, logs, and model data remain excluded.
+**Architecture:** Preserve the existing MiaAI-Lab history, create a local `main` branch, retain the original repository as `upstream`, and publish the customized branch to a new `origin`. Tracked reusable configuration and useful inherited benchmark source/checkpoint documentation remain available as upstream provenance; generated or local outputs, active environment files, credentials, caches, logs, and model data remain excluded.
 
 **Tech Stack:** Git, GitHub CLI, Docker Compose, Bash, vLLM
 
@@ -13,7 +13,8 @@
 - Preserve existing MiaAI-Lab commit history and attribution.
 - Publish as a public standalone repository, not a GitHub fork.
 - Repository name must be `DeepSeek-V4-Flash-DSpark-2x-DGX-Spark`.
-- Never add `.env.dspark`, keys, tokens, logs, caches, benchmarks, or model weights.
+- Retain useful benchmark source code and checkpoint Markdown already inherited from upstream history.
+- Never add generated benchmark results/output directories, local runtime captures, `.env.dspark`, credentials, keys, tokens, logs, caches, or model weights.
 - Preserve the existing `restart: unless-stopped` customization.
 - Do not stop or restart the currently running DeepSeek service.
 
