@@ -5,14 +5,64 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env.dspark}"
 COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.dspark.yml}"
 PROJECT_NAME="${PROJECT_NAME:-deepseek-v4-flash}"
-API_URL="${API_URL:-http://127.0.0.1:8888/v1/models}"
-CHAT_URL="${CHAT_URL:-http://127.0.0.1:8888/v1/chat/completions}"
 WAIT_ATTEMPTS="${WAIT_ATTEMPTS:-100}"
 WAIT_SECONDS="${WAIT_SECONDS:-15}"
-PORT="${PORT:-8888}"
 ENABLE_VLLM_GB10_PATCH="${ENABLE_VLLM_GB10_PATCH:-0}"
 VLLM_GB10_PATCH_DIR="${VLLM_GB10_PATCH_DIR:-$SCRIPT_DIR/vllm_patch_gb10}"
 DSPARK_PROPOSER_FILE="${DSPARK_PROPOSER_FILE:-$SCRIPT_DIR/recipe/vllm/v1/spec_decode/dspark_proposer.py}"
+CLI_VLLM_HOST=""
+CLI_VLLM_PORT=""
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--host HOST] [--port PORT]
+
+Options:
+  --host HOST  vLLM API bind address (default: VLLM_HOST or 127.0.0.1)
+  --port PORT  vLLM API listen port (default: VLLM_PORT or 8888)
+  -h, --help   Show this help message
+
+Command-line options override values from $ENV_FILE.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --host)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "--host requires a value." >&2; exit 2; }
+      CLI_VLLM_HOST="$2"
+      shift 2
+      ;;
+    --host=*)
+      CLI_VLLM_HOST="${1#*=}"
+      [ -n "$CLI_VLLM_HOST" ] || { echo "--host requires a value." >&2; exit 2; }
+      shift
+      ;;
+    --port)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "--port requires a value." >&2; exit 2; }
+      CLI_VLLM_PORT="$2"
+      shift 2
+      ;;
+    --port=*)
+      CLI_VLLM_PORT="${1#*=}"
+      [ -n "$CLI_VLLM_PORT" ] || { echo "--port requires a value." >&2; exit 2; }
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      [ "$#" -eq 0 ] || { echo "Unexpected positional argument: $1" >&2; usage >&2; exit 2; }
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
 if [ ! -f "$ENV_FILE" ]; then
   echo "Missing $ENV_FILE. Copy .env.dspark.example to .env.dspark and edit node-specific values." >&2
@@ -29,6 +79,47 @@ set -a
 source "$ENV_FILE"
 set +a
 
+# CLI values have highest precedence; the env file remains the persistent
+# configuration source when no command-line override is provided.
+VLLM_HOST="${CLI_VLLM_HOST:-${VLLM_HOST:-127.0.0.1}}"
+VLLM_PORT="${CLI_VLLM_PORT:-${VLLM_PORT:-${PORT:-8888}}}"
+if [ -z "$VLLM_HOST" ]; then
+  echo "VLLM host must not be empty." >&2
+  exit 2
+fi
+if ! [[ "$VLLM_PORT" =~ ^[0-9]+$ ]]; then
+  echo "VLLM port must be an integer between 1 and 65535: $VLLM_PORT" >&2
+  exit 2
+fi
+if (( 10#$VLLM_PORT < 1 || 10#$VLLM_PORT > 65535 )); then
+  echo "VLLM port must be between 1 and 65535: $VLLM_PORT" >&2
+  exit 2
+fi
+VLLM_PORT="$((10#$VLLM_PORT))"
+# Keep PORT as a backwards-compatible alias, but use VLLM_PORT internally.
+PORT="$VLLM_PORT"
+DEFAULT_THINKING="${DEFAULT_THINKING:-low}"
+case "$DEFAULT_THINKING" in
+  off|low|high|max) ;;
+  *)
+    echo "DEFAULT_THINKING must be one of: off, low, high, max (got: $DEFAULT_THINKING)" >&2
+    exit 2
+    ;;
+esac
+export VLLM_HOST VLLM_PORT PORT DEFAULT_THINKING
+
+# A wildcard is valid for binding but not a useful health-check destination.
+API_HOST="${API_HOST:-$VLLM_HOST}"
+case "$API_HOST" in
+  0.0.0.0|::|\[::\]) API_HOST="127.0.0.1" ;;
+esac
+URL_HOST="$API_HOST"
+if [[ "$URL_HOST" == *:* && "$URL_HOST" != \[*\] ]]; then
+  URL_HOST="[$URL_HOST]"
+fi
+API_URL="${API_URL:-http://$URL_HOST:$VLLM_PORT/v1/models}"
+CHAT_URL="${CHAT_URL:-http://$URL_HOST:$VLLM_PORT/v1/chat/completions}"
+
 : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE}"
 : "${MASTER_ADDR:?MASTER_ADDR must be set in $ENV_FILE}"
 : "${MASTER_PORT:?MASTER_PORT must be set in $ENV_FILE}"
@@ -40,6 +131,27 @@ VLLM_HOST_IP="${VLLM_HOST_IP:-$MASTER_ADDR}"
 WORKER_VLLM_HOST_IP="${WORKER_VLLM_HOST_IP:-$WORKER_HOST}"
 WORKER_DIR="${WORKER_SCRIPT_DIR:-${WORKER_DIR:-$SCRIPT_DIR}}"
 WORKER_HF_CACHE="${WORKER_HF_CACHE:-${HF_CACHE:-}}"
+# Per-node CX7/RoCE pins (3-node ring: facing ports often differ by hostname).
+# Set WORKER_NCCL_* in the head .env; start script injects them on remote compose.
+# Do not put WORKER_* first in docker-compose substitution — that is not rank-aware.
+WORKER_NCCL_IB_HCA="${WORKER_NCCL_IB_HCA:-$NCCL_IB_HCA}"
+WORKER_NCCL_SOCKET_IFNAME="${WORKER_NCCL_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}"
+WORKER_TP_SOCKET_IFNAME="${WORKER_TP_SOCKET_IFNAME:-${TP_SOCKET_IFNAME:-$WORKER_NCCL_SOCKET_IFNAME}}"
+WORKER_GLOO_SOCKET_IFNAME="${WORKER_GLOO_SOCKET_IFNAME:-${GLOO_SOCKET_IFNAME:-$WORKER_NCCL_SOCKET_IFNAME}}"
+# RoCEv2 GID index differs per node and drifts after reboot/link events.
+# Default: resolve from sysfs at launch (NCCL_IB_GID_AUTO=1). Do not reuse one
+# literal for both ranks — that wedges NCCL with "unhandled system error".
+# Set NCCL_IB_GID_AUTO=0 and pin NCCL_IB_GID_INDEX / WORKER_NCCL_IB_GID_INDEX
+# only if you need a manual override.
+NCCL_IB_GID_AUTO="${NCCL_IB_GID_AUTO:-1}"
+# Optional match IPs if the RoCE address is not on NCCL_SOCKET_IFNAME /
+# WORKER_NCCL_SOCKET_IFNAME (rare). Prefer interface IPv4 when unset.
+NCCL_IB_GID_MATCH_IP="${NCCL_IB_GID_MATCH_IP:-}"
+WORKER_NCCL_IB_GID_MATCH_IP="${WORKER_NCCL_IB_GID_MATCH_IP:-}"
+# Preserve env pins for AUTO=0; do NOT default worker to head index before resolve.
+ENV_NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-}"
+ENV_WORKER_NCCL_IB_GID_INDEX="${WORKER_NCCL_IB_GID_INDEX:-}"
+WORKER_NCCL_IB_GID_INDEX="${ENV_WORKER_NCCL_IB_GID_INDEX}"
 REMOTE_WORKER_DIR="$(printf '%q' "$WORKER_DIR")"
 REMOTE_COMPOSE_FILE="$REMOTE_WORKER_DIR/docker-compose.dspark.yml"
 REMOTE_ENV_FILE="$REMOTE_WORKER_DIR/.env.dspark"
@@ -54,6 +166,150 @@ need_cmd() {
   fi
 }
 
+# Strip user@ from ssh targets / host strings → bare host or IPv4.
+host_without_user() {
+  local h="$1"
+  if [[ "$h" == *@* ]]; then
+    printf '%s' "${h##*@}"
+  else
+    printf '%s' "$h"
+  fi
+}
+
+ipv4_to_gid_suffix() {
+  # IPv4-mapped RoCEv2 GID ends with ffff:aabb:ccdd for a.b.c.d
+  local ip="$1" a b c d
+  IFS=. read -r a b c d <<<"$ip" || return 1
+  printf '%02x%02x:%02x%02x' "$a" "$b" "$c" "$d"
+}
+
+# First IPv4 on an interface: empty host = local, else ssh target.
+iface_ipv4() {
+  local ssh_target="$1" ifname="$2"
+  local cmd
+  cmd="ip -4 -o addr show dev $(printf '%q' "$ifname") 2>/dev/null | awk '{print \$4}' | head -1 | cut -d/ -f1"
+  if [ -z "$ssh_target" ]; then
+    bash -c "$cmd"
+  else
+    # shellcheck disable=SC2029
+    ssh "$ssh_target" "$cmd"
+  fi
+}
+
+# Resolve RoCEv2 GID index for HCA whose GID embeds match_ip.
+# $1=ssh target (empty=local)  $2=HCA  $3=IPv4 to match
+resolve_rocev2_gid_index() {
+  local ssh_target="$1" hca="$2" match_ip="$3"
+  local hex remote
+  hex="$(ipv4_to_gid_suffix "$match_ip")" || return 1
+  remote=$(
+    cat <<EOF
+hca=$(printf '%q' "$hca")
+hex=$(printf '%q' "$hex")
+for g in /sys/class/infiniband/\$hca/ports/1/gids/*; do
+  [ -e "\$g" ] || continue
+  i=\${g##*/}
+  t=\$(cat /sys/class/infiniband/\$hca/ports/1/gid_attrs/types/\$i 2>/dev/null || true)
+  [ "\$t" = "RoCE v2" ] || continue
+  case \$(cat "\$g" 2>/dev/null) in
+    *ffff:\${hex}) echo "\$i"; exit 0 ;;
+  esac
+done
+exit 1
+EOF
+  )
+  if [ -z "$ssh_target" ]; then
+    bash -c "$remote"
+  else
+    # shellcheck disable=SC2029
+    ssh "$ssh_target" "bash -s" <<<"$remote"
+  fi
+}
+
+pick_gid_match_ip() {
+  # $1=ssh  $2=ifname  $3=explicit match  $4=fallback vllm ip  $5=fallback host/ip
+  local ssh_target="$1" ifname="$2" explicit="$3" vllm_ip="$4" fallback="$5"
+  local ip
+  if [ -n "$explicit" ]; then
+    printf '%s' "$explicit"
+    return 0
+  fi
+  ip="$(iface_ipv4 "$ssh_target" "$ifname" || true)"
+  if [ -n "$ip" ]; then
+    printf '%s' "$ip"
+    return 0
+  fi
+  if [ -n "$vllm_ip" ] && [[ "$vllm_ip" != *@* ]] && [[ "$vllm_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf '%s' "$vllm_ip"
+    return 0
+  fi
+  fallback="$(host_without_user "$fallback")"
+  if [[ "$fallback" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf '%s' "$fallback"
+    return 0
+  fi
+  return 1
+}
+
+resolve_nccl_gid_indexes() {
+  local head_match worker_match resolved_head resolved_worker
+
+  if [ "$NCCL_IB_GID_AUTO" = "0" ]; then
+    NCCL_IB_GID_INDEX="${ENV_NCCL_IB_GID_INDEX:-}"
+    WORKER_NCCL_IB_GID_INDEX="${ENV_WORKER_NCCL_IB_GID_INDEX:-$NCCL_IB_GID_INDEX}"
+    if [ -z "$NCCL_IB_GID_INDEX" ] || [ -z "$WORKER_NCCL_IB_GID_INDEX" ]; then
+      echo "NCCL_IB_GID_AUTO=0 requires NCCL_IB_GID_INDEX and preferably WORKER_NCCL_IB_GID_INDEX in $ENV_FILE." >&2
+      exit 1
+    fi
+    echo "Using pinned NCCL GID indexes (auto off): head=$NCCL_IB_GID_INDEX worker=$WORKER_NCCL_IB_GID_INDEX"
+    return 0
+  fi
+
+  head_match="$(pick_gid_match_ip "" "$NCCL_SOCKET_IFNAME" "$NCCL_IB_GID_MATCH_IP" "$VLLM_HOST_IP" "$MASTER_ADDR")" || {
+    echo "FATAL: could not determine head RoCE IPv4 for GID match (if=$NCCL_SOCKET_IFNAME)." >&2
+    exit 1
+  }
+  worker_match="$(pick_gid_match_ip "$WORKER_HOST" "$WORKER_NCCL_SOCKET_IFNAME" "$WORKER_NCCL_IB_GID_MATCH_IP" "$WORKER_VLLM_HOST_IP" "$WORKER_HOST")" || {
+    echo "FATAL: could not determine worker RoCE IPv4 for GID match (if=$WORKER_NCCL_SOCKET_IFNAME)." >&2
+    exit 1
+  }
+
+  echo "Resolving RoCEv2 GID indexes from sysfs (head if=$NCCL_SOCKET_IFNAME ip=$head_match hca=$NCCL_IB_HCA; worker if=$WORKER_NCCL_SOCKET_IFNAME ip=$worker_match hca=$WORKER_NCCL_IB_HCA)..."
+  resolved_head="$(resolve_rocev2_gid_index "" "$NCCL_IB_HCA" "$head_match")" || {
+    echo "FATAL: could not resolve head RoCEv2 GID index for $NCCL_IB_HCA / $head_match." >&2
+    echo "Check: ibstat | grep -A3 $NCCL_IB_HCA ; show_gids | grep $NCCL_IB_HCA" >&2
+    exit 1
+  }
+  resolved_worker="$(resolve_rocev2_gid_index "$WORKER_HOST" "$WORKER_NCCL_IB_HCA" "$worker_match")" || {
+    echo "FATAL: could not resolve worker RoCEv2 GID index for $WORKER_NCCL_IB_HCA / $worker_match." >&2
+    echo "Check on worker: show_gids | grep $WORKER_NCCL_IB_HCA" >&2
+    exit 1
+  }
+
+  if [ -n "$ENV_NCCL_IB_GID_INDEX" ] && [ "$ENV_NCCL_IB_GID_INDEX" != "$resolved_head" ]; then
+    echo "Note: $ENV_FILE has NCCL_IB_GID_INDEX=$ENV_NCCL_IB_GID_INDEX but sysfs resolved head=$resolved_head (using resolved)."
+  fi
+  if [ -n "$ENV_WORKER_NCCL_IB_GID_INDEX" ] && [ "$ENV_WORKER_NCCL_IB_GID_INDEX" != "$resolved_worker" ]; then
+    echo "Note: $ENV_FILE has WORKER_NCCL_IB_GID_INDEX=$ENV_WORKER_NCCL_IB_GID_INDEX but sysfs resolved worker=$resolved_worker (using resolved)."
+  fi
+
+  NCCL_IB_GID_INDEX="$resolved_head"
+  WORKER_NCCL_IB_GID_INDEX="$resolved_worker"
+  echo "RoCEv2 GID index: head=$NCCL_IB_GID_INDEX (match $head_match) worker=$WORKER_NCCL_IB_GID_INDEX (match $worker_match)"
+}
+
+remote_nccl_env() {
+  # Rebuild each call so GID resolve after early init is visible on the worker.
+  printf "NCCL_IB_HCA='%s' NCCL_SOCKET_IFNAME='%s' TP_SOCKET_IFNAME='%s' GLOO_SOCKET_IFNAME='%s' NCCL_IB_GID_INDEX='%s' VLLM_HOST='%s' VLLM_PORT='%s'" \
+    "$WORKER_NCCL_IB_HCA" \
+    "$WORKER_NCCL_SOCKET_IFNAME" \
+    "$WORKER_TP_SOCKET_IFNAME" \
+    "$WORKER_GLOO_SOCKET_IFNAME" \
+    "$WORKER_NCCL_IB_GID_INDEX" \
+    "$VLLM_HOST" \
+    "$VLLM_PORT"
+}
+
 compose_base() {
   env -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1 \
     WORKER_HOST="$WORKER_HOST" \
@@ -62,6 +318,8 @@ compose_base() {
     NCCL_IB_HCA="$NCCL_IB_HCA" \
     NCCL_SOCKET_IFNAME="$NCCL_SOCKET_IFNAME" \
     NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-}" \
+    VLLM_HOST="$VLLM_HOST" \
+    VLLM_PORT="$VLLM_PORT" \
     VLLM_HOST_IP="$VLLM_HOST_IP" \
     ENABLE_VLLM_GB10_PATCH="$ENABLE_VLLM_GB10_PATCH" \
     VLLM_GB10_PATCH_DIR="$VLLM_GB10_PATCH_DIR" \
@@ -72,7 +330,7 @@ compose_base() {
 }
 
 remote_compose() {
-  ssh "$WORKER_HOST" "$REMOTE_COMPOSE $*"
+  ssh "$WORKER_HOST" "$REMOTE_COMPOSE $(remote_nccl_env) $*"
 }
 
 log_since() {
@@ -125,9 +383,18 @@ print_resolved_profile() {
   echo "  max num seqs: ${MAX_NUM_SEQS:-12}"
   echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8192}"
   echo "  gpu memory utilization: ${GPU_MEMORY_UTILIZATION:-0.80}"
-  echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5}"
-  echo "  head host/ip: ${VLLM_HOST:-127.0.0.1} / $VLLM_HOST_IP"
+  echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5} (dspark_block_size min is 5)"
+  echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
+  echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-5} + 1) ))"
+  echo "  API bind: $VLLM_HOST:$VLLM_PORT"
+  echo "  API probe: $API_URL"
+  echo "  head fabric IP: $VLLM_HOST_IP"
   echo "  worker host/ip: $WORKER_HOST / $WORKER_VLLM_HOST_IP"
+  echo "  head NCCL HCA/if: $NCCL_IB_HCA / $NCCL_SOCKET_IFNAME"
+  echo "  worker NCCL HCA/if: $WORKER_NCCL_IB_HCA / $WORKER_NCCL_SOCKET_IFNAME"
+  echo "  NCCL_IB_GID_AUTO: $NCCL_IB_GID_AUTO"
+  echo "  head NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX:-}"
+  echo "  worker NCCL_IB_GID_INDEX: ${WORKER_NCCL_IB_GID_INDEX:-}"
   echo "  worker dir: $WORKER_DIR"
   echo "  worker cache: ${WORKER_HF_CACHE:-${HF_CACHE:-}}"
   echo "  GB10 vLLM patch: $ENABLE_VLLM_GB10_PATCH"
@@ -187,14 +454,15 @@ if docker ps --format '{{.Names}}' | grep -qx "${PROJECT_NAME}-vllm-dspark-1"; t
   exit 1
 fi
 
-if command -v ss >/dev/null 2>&1 && ss -ltn "( sport = :$PORT )" | tail -n +2 | grep -q .; then
-  echo "Port $PORT is already listening on the head node. Stop the conflicting service first." >&2
+if command -v ss >/dev/null 2>&1 && ss -ltn "( sport = :$VLLM_PORT )" | tail -n +2 | grep -q .; then
+  echo "Port $VLLM_PORT is already listening on the head node. Stop the conflicting service first." >&2
   exit 1
 fi
 
 ssh "$WORKER_HOST" "if docker ps --format '{{.Names}}' | grep -qx '${PROJECT_NAME}-vllm-dspark-1'; then echo 'DSpark worker container already exists for project $PROJECT_NAME.' >&2; exit 1; fi"
 
 cd "$SCRIPT_DIR"
+resolve_nccl_gid_indexes
 STARTUP_LOG_SINCE="$(log_since)"
 trap on_error ERR
 print_resolved_profile
@@ -231,7 +499,7 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
     echo "Running minimal OpenAI-compatible chat request..."
     curl -fsS --max-time 60 "$CHAT_URL" \
       -H "Content-Type: application/json" \
-      -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":8,"temperature":0.0}' >/dev/null
+      -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"temperature":0.0}' >/dev/null
     echo "Minimal chat request succeeded."
     exit 0
   fi
