@@ -1,6 +1,11 @@
 .env.dspark
 .env.dspark.works
 .env
+# Tracked profile envs are placeholder templates for
+# switch-deepseek-v4-flash.sh, safe to publish. Real cluster addresses go in
+# profiles/<name>/.env.local, which stays local, as does the active .env.dspark.
+!profiles/*/.env
+profiles/*/.env.local
 .secrets/
 *.pem
 *.key
