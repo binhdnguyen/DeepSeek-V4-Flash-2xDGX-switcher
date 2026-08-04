@@ -5,7 +5,9 @@
 # switch-deepseek-v4-flash.sh, safe to publish. Real cluster addresses go in
 # profiles/<name>/.env.local, which stays local, as does the active .env.dspark.
 !profiles/*/.env
+!profiles/*/profile.env
 profiles/*/.env.local
+.profile-state
 .secrets/
 *.pem
 *.key
