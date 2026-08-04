@@ -29,12 +29,26 @@ def switch_repo(tmp_path: Path) -> Path:
         )
         for action in ("start", "stop", "verify"):
             adapter = profile_dir / f"{action}.sh"
-            adapter.write_text("#!/usr/bin/env bash\nexit 0\n")
+            adapter.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f"printf '%s\\n' '{profile} {action}' >> \"${{LIFECYCLE_LOG}}\"\n"
+                f"exit \"${{EXIT_{profile.upper()}_{action.upper()}:-0}}\"\n"
+            )
             adapter.chmod(adapter.stat().st_mode | stat.S_IXUSR)
 
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
-    for command in ("curl", "jq", "ss", "docker", "ssh"):
+    curl = fake_bin / "curl"
+    curl.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"${*: -1}\" in\n"
+        "  */metrics) printf '%s\\n' \"${FAKE_METRICS:-}\" ;;\n"
+        "  */v1/models) printf '%s\\n' '${FAKE_MODELS:-{\"data\":[]}}' ;;\n"
+        "esac\n"
+    )
+    curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+    for command in ("jq", "ss", "docker", "ssh"):
         executable = fake_bin / command
         executable.write_text("#!/usr/bin/env bash\nexit 0\n")
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
@@ -42,33 +56,23 @@ def switch_repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def run_switch(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    command = """
-set -euo pipefail
-SCRIPT_DIR="$SWITCH_REPO_ROOT"
-PROFILE_DIR="$SCRIPT_DIR/profiles"
-source "$SCRIPT_DIR/scripts/profile_switch_lib.sh"
-case "${1:-toggle}" in
-  --profiles) profile_names ;;
-  --check) printf 'active profile : %s\\n' "$(active_profile)" ;;
-  --dry-run)
-    target="${2:-$(next_profile "$(active_profile)")}" 
-    printf 'target profile : %s\\n' "$target"
-    ;;
-  *) printf 'unsupported test command: %s\\n' "$1" >&2; exit 2 ;;
-esac
-"""
+def run_switch(
+    repo: Path, *args: str, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment.update(
         {
             "SWITCH_REPO_ROOT": str(repo),
             "PROFILE_STATE_FILE": str(repo / ".profile-state"),
             "API_URL": "http://127.0.0.1:1/v1/models",
+            "METRICS_URL": "http://127.0.0.1:1/metrics",
+            "LIFECYCLE_LOG": str(repo / "lifecycle.log"),
             "PATH": f"{repo / 'fake-bin'}:{environment['PATH']}",
         }
     )
+    environment.update(extra_env or {})
     return subprocess.run(
-        ["bash", "-c", command, "profile-switch-test", *args],
+        [str(repo / "switch-deepseek-v4-flash.sh"), *args],
         cwd=repo,
         env=environment,
         text=True,
@@ -202,3 +206,58 @@ def test_write_active_profile_atomically_replaces_state(switch_repo: Path):
     assert result.returncode == 0, result.stderr
     assert state_file.read_text() == "robolab\n"
     assert list(switch_repo.glob(".profile-state.tmp.*")) == []
+
+def lifecycle_calls(repo: Path) -> list[str]:
+    path = repo / "lifecycle.log"
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def test_dry_run_validates_all_three_profile_adapters(switch_repo: Path):
+    result = run_switch(switch_repo, "--dry-run", "robolab")
+    assert result.returncode == 0, result.stderr
+    assert "DRY-RUN: no changes made" in result.stdout
+    assert lifecycle_calls(switch_repo) == []
+
+
+def test_switch_refuses_when_vllm_has_running_requests(switch_repo: Path):
+    write_state(switch_repo, "0731")
+    metrics = 'vllm:num_requests_running{engine="0"} 2\nvllm:num_requests_waiting{engine="0"} 0'
+    result = run_switch(
+        switch_repo, "robolab", extra_env={"FAKE_METRICS": metrics}
+    )
+    assert result.returncode != 0
+    assert "active requests" in result.stderr
+    assert lifecycle_calls(switch_repo) == []
+
+
+def test_failed_target_start_rolls_back_without_changing_state(switch_repo: Path):
+    write_state(switch_repo, "0731")
+    result = run_switch(
+        switch_repo, "robolab", extra_env={"EXIT_ROBOLAB_START": "1"}
+    )
+    assert result.returncode != 0
+    assert lifecycle_calls(switch_repo) == [
+        "0731 stop",
+        "robolab start",
+        "robolab stop",
+        "0731 start",
+        "0731 verify",
+    ]
+    assert (switch_repo / ".profile-state").read_text() == "0731\n"
+
+
+def test_state_changes_only_after_verify(switch_repo: Path):
+    write_state(switch_repo, "0731")
+    result = run_switch(
+        switch_repo, "robolab", extra_env={"EXIT_ROBOLAB_VERIFY": "1"}
+    )
+    assert result.returncode != 0
+    assert lifecycle_calls(switch_repo) == [
+        "0731 stop",
+        "robolab start",
+        "robolab verify",
+        "robolab stop",
+        "0731 start",
+        "0731 verify",
+    ]
+    assert (switch_repo / ".profile-state").read_text() == "0731\n"

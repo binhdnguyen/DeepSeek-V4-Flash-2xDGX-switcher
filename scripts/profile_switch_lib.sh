@@ -63,9 +63,61 @@ validate_profile_layout() {
     }
   done
 }
+requests_in_flight() {
+  local metrics="${METRICS_URL:-http://127.0.0.1:8888/metrics}" text running waiting
+  text="$(curl -fsS --max-time 5 "$metrics" 2>/dev/null || true)"
+  if [[ -z "$text" ]]; then
+    printf '0 0\n'
+    return
+  fi
+  running="$(printf '%s\n' "$text" | awk '/^vllm:num_requests_running[{ ]/ {sum += $NF} END {print sum + 0}')"
+  waiting="$(printf '%s\n' "$text" | awk '/^vllm:num_requests_waiting[{ ]/ {sum += $NF} END {print sum + 0}')"
+  printf '%s %s\n' "$running" "$waiting"
+}
+
+assert_endpoint_idle() {
+  local running waiting
+  read -r running waiting < <(requests_in_flight)
+  if (( running > 0 || waiting > 0 )); then
+    printf 'error: endpoint has active requests: running=%s waiting=%s\n' "$running" "$waiting" >&2
+    return 1
+  fi
+}
+
+run_profile_adapter() {
+  local profile="$1" action="$2"
+  PROFILE_REPO_ROOT="$SCRIPT_DIR" PROFILE_ENV_FILE="$(profile_env "$profile")" \
+    "$(profile_adapter "$profile" "$action")"
+}
+
+activate_profile() {
+  local target="$1" prior="$2"
+  validate_profile_layout "$target"
+  assert_endpoint_idle
+  if [[ "$prior" != unknown && "$prior" != none ]]; then
+    run_profile_adapter "$prior" stop
+  fi
+  if run_profile_adapter "$target" start && run_profile_adapter "$target" verify; then
+    write_active_profile "$target"
+    return 0
+  fi
+  printf 'error: activation of %s failed; rolling back to %s\n' "$target" "$prior" >&2
+  run_profile_adapter "$target" stop || true
+  if [[ "$prior" != unknown && "$prior" != none ]]; then
+    run_profile_adapter "$prior" start
+    run_profile_adapter "$prior" verify
+  fi
+  return 1
+}
+
 
 write_active_profile() {
-  local temporary="$PROFILE_STATE_FILE.tmp.$$"
+  local state_dir temporary
+  state_dir="$(dirname "$PROFILE_STATE_FILE")"
+  mkdir -p "$state_dir"
+  temporary="$(mktemp "$state_dir/.profile-state.tmp.XXXXXX")"
+  trap 'rm -f "$temporary"' RETURN
   printf '%s\n' "$1" >"$temporary"
   mv "$temporary" "$PROFILE_STATE_FILE"
+  trap - RETURN
 }
