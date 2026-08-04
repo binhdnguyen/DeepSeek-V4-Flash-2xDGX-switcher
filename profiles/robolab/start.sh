@@ -15,5 +15,13 @@ export MASTER_ADDR WORKER_HOST MASTER_PORT HF_CACHE DSPARK_MODEL_DIR DSPARK_HEAD
 export HEAD_ETH_IF WORKER_ETH_IF HEAD_IB_HCA WORKER_IB_HCA NCCL_IB_GID_INDEX SERVED_MODEL_NAME
 export MAX_MODEL_LEN=327680 MAX_NUM_SEQS=16 MAX_NUM_BATCHED_TOKENS=16384
 export GPU_MEMORY_UTILIZATION=0.835 KV_CACHE_MEMORY_BYTES=15998753178 MTP_NUM_TOKENS=6
-export KV_CACHE_DTYPE=nvfp4_ds_mla MOE_BACKEND=flashinfer_b12x
-exec "$ROBOLAB_CHECKOUT/scripts/run-dspark-dual-gb10.sh"
+"$ROBOLAB_CHECKOUT/scripts/run-dspark-dual-gb10.sh"
+for _ in $(seq 1 120); do
+  if curl -fsS --max-time 5 http://127.0.0.1:8888/v1/models \
+      | jq -e '.data | any(.id == "deepseek-v4-flash-dspark")' >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 15
+done
+echo 'error: timed out waiting for r0b0lab API readiness' >&2
+exit 1
