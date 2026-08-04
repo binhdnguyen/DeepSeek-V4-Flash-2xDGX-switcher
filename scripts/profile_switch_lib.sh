@@ -46,13 +46,18 @@ profile_adapter() {
 }
 
 validate_profile_layout() {
-  local profile="$1" action file
+  local profile="$1" action file metadata
   file="$(profile_env "$profile")"
+  metadata="$PROFILE_DIR/$profile/profile.env"
+  [[ -f "$metadata" ]] || {
+    printf 'missing profile metadata: %s\n' "$metadata" >&2
+    return 1
+  }
   [[ -f "$file" ]] || {
     printf 'missing profile env: %s\n' "$file" >&2
     return 1
   }
-  [[ "$(profile_value "$profile" PROFILE_NAME)" == "$profile" ]] || {
+  [[ "$(sed -n 's/^PROFILE_NAME=//p' "$metadata" | sed -n '1p')" == "$profile" ]] || {
     printf 'PROFILE_NAME mismatch for %s\n' "$profile" >&2
     return 1
   }
