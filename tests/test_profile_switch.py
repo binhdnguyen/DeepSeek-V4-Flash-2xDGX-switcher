@@ -77,6 +77,32 @@ esac
     )
 
 
+def run_helper(repo: Path, command: str, *args: str) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "SCRIPT_DIR": str(repo),
+            "PROFILE_DIR": str(repo / "profiles"),
+            "PROFILE_STATE_FILE": str(repo / ".profile-state"),
+        }
+    )
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'set -euo pipefail; source "$SCRIPT_DIR/scripts/profile_switch_lib.sh"; "$@"',
+            "profile-switch-helper",
+            command,
+            *args,
+        ],
+        cwd=repo,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def write_state(repo: Path, profile: str) -> None:
     (repo / ".profile-state").write_text(f"{profile}\n")
 
@@ -113,3 +139,66 @@ def test_same_checkpoint_profiles_use_state_not_model_name(switch_repo: Path):
     write_state(switch_repo, "robolab")
     result = run_switch(switch_repo, "--check")
     assert "active profile : robolab" in result.stdout
+
+
+def test_profile_env_prefers_local_override(switch_repo: Path):
+    local_env = switch_repo / "profiles" / "robolab" / ".env.local"
+    local_env.write_text("PROFILE_NAME=robolab\nDSPARK_MODEL=local-model\n")
+
+    result = run_helper(switch_repo, "profile_env", "robolab")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(local_env)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("MODEL=unquoted-value", "unquoted-value"),
+        ('MODEL="double quoted value"', "double quoted value"),
+    ],
+)
+def test_profile_value_reads_supported_env_values(
+    switch_repo: Path, line: str, expected: str
+):
+    profile_env = switch_repo / "profiles" / "0731" / "profile.env"
+    profile_env.write_text(f"PROFILE_NAME=0731\n{line}\n")
+
+    result = run_helper(switch_repo, "profile_value", "0731", "MODEL")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+
+
+def test_validate_profile_layout_rejects_profile_name_mismatch(switch_repo: Path):
+    profile_env = switch_repo / "profiles" / "robolab" / "profile.env"
+    profile_env.write_text("PROFILE_NAME=dspark\n")
+
+    result = run_helper(switch_repo, "validate_profile_layout", "robolab")
+
+    assert result.returncode == 1
+    assert "PROFILE_NAME mismatch for robolab" in result.stderr
+
+
+@pytest.mark.parametrize("adapter", ["start", "stop", "verify"])
+def test_validate_profile_layout_rejects_non_executable_adapter(
+    switch_repo: Path, adapter: str
+):
+    adapter_path = switch_repo / "profiles" / "robolab" / f"{adapter}.sh"
+    adapter_path.chmod(adapter_path.stat().st_mode & ~stat.S_IXUSR)
+
+    result = run_helper(switch_repo, "validate_profile_layout", "robolab")
+
+    assert result.returncode == 1
+    assert f"missing executable adapter: {adapter_path}" in result.stderr
+
+
+def test_write_active_profile_atomically_replaces_state(switch_repo: Path):
+    state_file = switch_repo / ".profile-state"
+    state_file.write_text("0731\n")
+
+    result = run_helper(switch_repo, "write_active_profile", "robolab")
+
+    assert result.returncode == 0, result.stderr
+    assert state_file.read_text() == "robolab\n"
+    assert list(switch_repo.glob(".profile-state.tmp.*")) == []
