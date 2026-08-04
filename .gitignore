@@ -23,3 +23,5 @@ benchmarks/
 RESULTS.md
 scripts/agent_sanity_bench.py
 scripts/capture_runtime.sh
+
+/.worktrees/
