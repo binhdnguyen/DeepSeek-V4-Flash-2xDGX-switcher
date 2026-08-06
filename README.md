@@ -111,6 +111,29 @@ path does not switch production to fp8 or a smaller fallback model.
 > harness session replay, fallback model list, and prompt/tool XML handling
 > before changing DSpark weights or falling back to fp8.
 
+## Default lane: DeepSeek-V4-Flash-0731
+
+This checkout runs **`DeepSeek-V4-Flash-0731`** (FP8 weights, upstream MiaAI-Lab
+recipe, 1M ctx) as its default lane, served as `deepseek-v4-flash-0731`.
+
+Two settings differ from the upstream recipe, both from measurement:
+
+- **`MTP_NUM_TOKENS=3`, not the recipe's 5.** At K=5, aggregate throughput is a
+  dead heat while draft acceptance drops 0.681 → 0.516 — strictly more discarded
+  draft compute for nothing. Note K cannot change token counts at all
+  (speculative decoding is distribution-preserving), so isolate it with
+  fixed-token runs; wall-clock differences between K runs are sampling noise.
+- **Thinking stays ON (`DEFAULT_THINKING=low`).** Forcing 0731 into non-thinking
+  mode makes it echo the source verbatim instead of translating, at ~50% of
+  chunks, via two mechanically independent routes (`reasoning_effort="none"` and
+  `chat_template_kwargs{thinking:false}`). It is the *mode* that breaks it, not
+  any one parameter. Budget accordingly: a 16-token probe returns empty with
+  `finish_reason=length` because the thinking channel consumes it.
+
+Switching lanes and per-profile details: [SWITCH-MODELS.md](SWITCH-MODELS.md).
+Unattended boot, power-cut recovery and the measured drill results:
+[docs/BOOT-AND-RECOVERY.md](docs/BOOT-AND-RECOVERY.md).
+
 ## Result
 
 ### Live Anemll image lane (this checkout)

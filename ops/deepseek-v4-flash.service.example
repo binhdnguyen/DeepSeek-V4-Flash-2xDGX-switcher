@@ -1,0 +1,48 @@
+# Boot unit for the 2-node DeepSeek-V4-Flash-0731 cluster.
+#
+# Install on the HEAD node:
+#   sed -e 's|__USER__|'"$USER"'|g' -e 's|__HOME__|'"$HOME"'|g' \
+#       -e 's|__REPO__|'"$PWD"'|g' ops/deepseek-v4-flash.service.example \
+#     | sudo tee /etc/systemd/system/deepseek-v4-flash.service >/dev/null
+#   sudo systemctl daemon-reload && sudo systemctl enable --now deepseek-v4-flash.service
+#
+# Requires passwordless SSH from head to worker (BatchMode, no agent) and
+# `sudo -n` on both nodes.
+
+[Unit]
+Description=DeepSeek-V4-Flash-0731 2-node cluster (default lane, :8888)
+Documentation=file:__REPO__/ops/deepseek-boot-start.sh
+After=docker.service network-online.target nvidia-persistenced.service
+Wants=network-online.target nvidia-persistenced.service
+Requires=docker.service
+
+# If you also run a single-node model on this box, it cannot coexist with this
+# lane: one GB10 per node, ~121 GB unified memory, and DeepSeek holds ~115 GB
+# across both nodes at TP=2. Note that a system unit's Conflicts= only resolves
+# OTHER SYSTEM UNITS — pointing it at a `systemctl --user` unit silently does
+# nothing. Disable the other lane at boot and rely on its own port/memory
+# preflight guards instead of a Conflicts= line that cannot fire.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=__USER__
+Group=__USER__
+Environment=HOME=__HOME__
+
+# Sized from measurement, not guesswork. deepseek-boot-start.sh waits up to
+# DS_WORKER_WAIT (default 2400s) for the worker, then makes up to 3 bring-up
+# attempts with a 900s health check each. The worker budget is deliberately
+# large because reboot-to-ready is dominated by SHUTDOWN, not boot: a measured
+# cycle took 14m22s, ~13 min of which was the vLLM container refusing to stop.
+TimeoutStartSec=9000
+ExecStart=__REPO__/ops/deepseek-boot-start.sh
+
+# Stop BOTH ranks on shutdown, so a head reboot does not strand the worker with
+# a rank-1 process hung at NCCL rendezvous. boot-start also clears ranks on the
+# way in, for power cuts where this never got to run.
+ExecStop=__REPO__/stop-deepseek-v4-flash-dspark.sh
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target
