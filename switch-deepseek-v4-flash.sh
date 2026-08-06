@@ -55,7 +55,7 @@ validate_target() {
   local target="$1" env_file
   validate_profile_layout "$target"
   env_file="$(profile_env "$target")"
-  if grep -qE '^(MASTER_ADDR|WORKER_HOST|ROBOLAB_CHECKOUT)=(head-roce-ip|worker-host-or-roce-ip|/path/to/)' "$env_file" 2>/dev/null; then
+  if grep -qE '^(MASTER_ADDR|WORKER_HOST)=(head-roce-ip|worker-host-or-roce-ip|/path/to/)' "$env_file" 2>/dev/null; then
     printf 'error: %s contains placeholder cluster values\n' "$env_file" >&2
     return 1
   fi

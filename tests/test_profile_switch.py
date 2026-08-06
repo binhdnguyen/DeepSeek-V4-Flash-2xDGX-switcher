@@ -20,7 +20,7 @@ def switch_repo(tmp_path: Path) -> Path:
         shutil.copy2(library, scripts)
 
     profiles = tmp_path / "profiles"
-    for profile in ("0731", "dspark", "robolab"):
+    for profile in ("0731", "dspark", "extra"):
         profile_dir = profiles / profile
         profile_dir.mkdir(parents=True)
         (profile_dir / "profile.env").write_text(
@@ -126,30 +126,29 @@ def dry_run_target(repo: Path) -> str:
 
 def test_lists_profiles_in_declared_order(switch_repo: Path):
     result = run_switch(switch_repo, "--profiles")
-    assert result.stdout.split() == ["0731", "dspark", "robolab"]
+    assert result.stdout.split() == ["0731", "dspark", "extra"]
 
 
 def test_toggle_cycles_through_three_profiles(switch_repo: Path):
     write_state(switch_repo, "0731")
     assert dry_run_target(switch_repo) == "dspark"
     write_state(switch_repo, "dspark")
-    assert dry_run_target(switch_repo) == "robolab"
-    write_state(switch_repo, "robolab")
+    assert dry_run_target(switch_repo) == "extra"
+    write_state(switch_repo, "extra")
     assert dry_run_target(switch_repo) == "0731"
 
 
 def test_same_checkpoint_profiles_use_state_not_model_name(switch_repo: Path):
     write_active_env(switch_repo, "deepseek-ai/DeepSeek-V4-Flash-0731")
-    write_state(switch_repo, "robolab")
+    write_state(switch_repo, "extra")
     result = run_switch(switch_repo, "--check")
-    assert "active profile : robolab" in result.stdout
+    assert "active profile : extra" in result.stdout
 
 
 def test_profiles_expose_distinct_served_model_names():
     expected = {
         "dspark": "deepseek-v4-flash-dspark",
         "0731": "deepseek-v4-flash-0731",
-        "robolab": "deepseek-v4-flash-robolab",
     }
     for profile, model in expected.items():
         env_path = REPO_ROOT / "profiles" / profile / ".env"
@@ -161,38 +160,14 @@ def test_profiles_expose_distinct_served_model_names():
         assert values["SERVED_MODEL_NAME"].strip('"') == model
 
 
-def test_robolab_preflight_only_skips_api_readiness_wait():
-    start_script = (REPO_ROOT / "profiles" / "robolab" / "start.sh").read_text()
-    launcher_call = 'ROBOLAB_CHECKOUT="$ROBOLAB_CHECKOUT" "$patched_launcher"'
-    preflight_exit = '[[ "${DSPARK_PREFLIGHT_ONLY:-0}" == "1" ]] && exit 0'
-    assert launcher_call in start_script
-    assert preflight_exit in start_script
-    assert start_script.index(launcher_call) < start_script.index(preflight_exit)
-    assert start_script.index(preflight_exit) < start_script.index("for _ in $(seq 1 120)")
 
-
-def test_robolab_launcher_patch_requires_snapshot_layout():
-    start_script = (REPO_ROOT / "profiles" / "robolab" / "start.sh").read_text()
-    assert 'path.parent.name != "snapshots"' in start_script
-    assert "model path is not an HF snapshot" in start_script
-
-
-def test_robolab_start_honors_trial_overrides_and_relaxes_k_gate():
-    start_script = (REPO_ROOT / "profiles" / "robolab" / "start.sh").read_text()
-    assert 'MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"' in start_script
-    assert 'MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"' in start_script
-    assert 'MTP_NUM_TOKENS="${MTP_NUM_TOKENS:-6}"' in start_script
-    assert 'KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-15998753178}"' in start_script
-    assert '"${SPEC_TOKENS}" == "5" || "${SPEC_TOKENS}" == "6"' in start_script
-    assert 'if [[ "${MTP_NUM_TOKENS}" == "5" ]]; then' in start_script
-    assert "admission relaxed for K=5 tuning" in start_script
 
 
 def test_profile_env_prefers_local_override(switch_repo: Path):
-    local_env = switch_repo / "profiles" / "robolab" / ".env.local"
-    local_env.write_text("PROFILE_NAME=robolab\nDSPARK_MODEL=local-model\n")
+    local_env = switch_repo / "profiles" / "extra" / ".env.local"
+    local_env.write_text("PROFILE_NAME=extra\nDSPARK_MODEL=local-model\n")
 
-    result = run_helper(switch_repo, "profile_env", "robolab")
+    result = run_helper(switch_repo, "profile_env", "extra")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == str(local_env)
@@ -218,23 +193,23 @@ def test_profile_value_reads_supported_env_values(
 
 
 def test_validate_profile_layout_rejects_profile_name_mismatch(switch_repo: Path):
-    profile_env = switch_repo / "profiles" / "robolab" / "profile.env"
+    profile_env = switch_repo / "profiles" / "extra" / "profile.env"
     profile_env.write_text("PROFILE_NAME=dspark\n")
 
-    result = run_helper(switch_repo, "validate_profile_layout", "robolab")
+    result = run_helper(switch_repo, "validate_profile_layout", "extra")
 
     assert result.returncode == 1
-    assert "PROFILE_NAME mismatch for robolab" in result.stderr
+    assert "PROFILE_NAME mismatch for extra" in result.stderr
 
 
 @pytest.mark.parametrize("adapter", ["start", "stop", "verify"])
 def test_validate_profile_layout_rejects_non_executable_adapter(
     switch_repo: Path, adapter: str
 ):
-    adapter_path = switch_repo / "profiles" / "robolab" / f"{adapter}.sh"
+    adapter_path = switch_repo / "profiles" / "extra" / f"{adapter}.sh"
     adapter_path.chmod(adapter_path.stat().st_mode & ~stat.S_IXUSR)
 
-    result = run_helper(switch_repo, "validate_profile_layout", "robolab")
+    result = run_helper(switch_repo, "validate_profile_layout", "extra")
 
     assert result.returncode == 1
     assert f"missing executable adapter: {adapter_path}" in result.stderr
@@ -244,10 +219,10 @@ def test_write_active_profile_atomically_replaces_state(switch_repo: Path):
     state_file = switch_repo / ".profile-state"
     state_file.write_text("0731\n")
 
-    result = run_helper(switch_repo, "write_active_profile", "robolab")
+    result = run_helper(switch_repo, "write_active_profile", "extra")
 
     assert result.returncode == 0, result.stderr
-    assert state_file.read_text() == "robolab\n"
+    assert state_file.read_text() == "extra\n"
     assert list(switch_repo.glob(".profile-state.tmp.*")) == []
 
 def lifecycle_calls(repo: Path) -> list[str]:
@@ -256,7 +231,7 @@ def lifecycle_calls(repo: Path) -> list[str]:
 
 
 def test_dry_run_validates_all_three_profile_adapters(switch_repo: Path):
-    result = run_switch(switch_repo, "--dry-run", "robolab")
+    result = run_switch(switch_repo, "--dry-run", "extra")
     assert result.returncode == 0, result.stderr
     assert "DRY-RUN: no changes made" in result.stdout
     assert lifecycle_calls(switch_repo) == []
@@ -266,7 +241,7 @@ def test_switch_refuses_when_vllm_has_running_requests(switch_repo: Path):
     write_state(switch_repo, "0731")
     metrics = 'vllm:num_requests_running{engine="0"} 2\nvllm:num_requests_waiting{engine="0"} 0'
     result = run_switch(
-        switch_repo, "robolab", extra_env={"FAKE_METRICS": metrics}
+        switch_repo, "extra", extra_env={"FAKE_METRICS": metrics}
     )
     assert result.returncode != 0
     assert "active requests" in result.stderr
@@ -277,7 +252,7 @@ def test_switch_refuses_when_live_endpoint_metrics_are_unavailable(switch_repo: 
     write_state(switch_repo, "0731")
     result = run_switch(
         switch_repo,
-        "robolab",
+        "extra",
         extra_env={"FAKE_MODELS": '{"data":[{"id":"deepseek-v4-flash-0731"}]}'},
     )
     assert result.returncode != 0
@@ -289,7 +264,7 @@ def test_switch_refuses_when_live_endpoint_metrics_are_nonnumeric(switch_repo: P
     write_state(switch_repo, "0731")
     result = run_switch(
         switch_repo,
-        "robolab",
+        "extra",
         extra_env={
             "FAKE_MODELS": '{"data":[{"id":"deepseek-v4-flash-0731"}]}',
             "FAKE_METRICS": 'vllm:num_requests_running{engine="0"} NaN\nvllm:num_requests_waiting{engine="0"} 0',
@@ -322,17 +297,17 @@ def test_failed_target_start_rolls_back_without_changing_state(switch_repo: Path
     write_state(switch_repo, "0731")
     result = run_switch(
         switch_repo,
-        "robolab",
+        "extra",
         extra_env={
-            "EXIT_ROBOLAB_START": "1",
+            "EXIT_EXTRA_START": "1",
             "FAKE_METRICS": 'vllm:num_requests_running{engine="0"} 0\nvllm:num_requests_waiting{engine="0"} 0',
         },
     )
     assert result.returncode != 0
     assert lifecycle_calls(switch_repo) == [
         "0731 stop",
-        "robolab start",
-        "robolab stop",
+        "extra start",
+        "extra stop",
         "0731 start",
         "0731 verify",
     ]
@@ -343,18 +318,18 @@ def test_state_changes_only_after_verify(switch_repo: Path):
     write_state(switch_repo, "0731")
     result = run_switch(
         switch_repo,
-        "robolab",
+        "extra",
         extra_env={
-            "EXIT_ROBOLAB_VERIFY": "1",
+            "EXIT_EXTRA_VERIFY": "1",
             "FAKE_METRICS": 'vllm:num_requests_running{engine="0"} 0\nvllm:num_requests_waiting{engine="0"} 0',
         },
     )
     assert result.returncode != 0
     assert lifecycle_calls(switch_repo) == [
         "0731 stop",
-        "robolab start",
-        "robolab verify",
-        "robolab stop",
+        "extra start",
+        "extra verify",
+        "extra stop",
         "0731 start",
         "0731 verify",
     ]
