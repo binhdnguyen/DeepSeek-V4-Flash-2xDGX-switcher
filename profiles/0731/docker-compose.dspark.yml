@@ -22,6 +22,13 @@ services:
       # Anemll layout (vLLM ships DSpark under v1/worker/gpu/spec_decode).
       # GB10 hybrid plugin tree for ENABLE_VLLM_GB10_PATCH=1 only.
       - ${VLLM_GB10_PATCH_DIR:-./vllm_patch_gb10}:/opt/vllm-gb10-hybrid-nvfp4
+      # Issue #21 encoder hotfix (encode_arguments_to_dsml dict args).
+      - ${DSPARK_ENCODING_ISSUE21_HOTFIX:-./patches/hotfix-encoding-dsv4-issue21.py}:/opt/hotfix-encoding-dsv4-issue21.py:ro
+      # Issue #22 hotfix (nvfp4_ds_mla dispatched to the slow BF16 KV kernel).
+      # Applied here, before vLLM is imported, instead of upstream's
+      # start-then-restart dance — a restart would cost a second weight load
+      # (~105 s) on every cold bring-up and every deepseek-restart.
+      - ${DSPARK_NVFP4_ISSUE22_HOTFIX:-./patches/hotfix-nvfp4-ds-mla-issue22.sh}:/opt/hotfix-nvfp4-ds-mla-issue22.sh:ro
       - ${DSPARK_TMP_HOST:-${HOME}/.cache/dspark-tmp}:/tmp
 
     # Env surface is split by runtime image:
@@ -33,6 +40,9 @@ services:
       HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
       TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
       HF_HUB_DISABLE_XET: "${HF_HUB_DISABLE_XET:-1}"
+      DSPARK_MODEL: "${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}"
+      # Pin HF revision (issue #19). Empty → tip of default branch / refs/main.
+      DSPARK_REVISION: "${DSPARK_REVISION:-}"
       DSPARK_ENCODING_FILE: "${DSPARK_ENCODING_FILE:-}"
       VLLM_CACHE_ROOT: /cache/huggingface/vllm-cache
       VLLM_HOST_IP: "${VLLM_HOST_IP:-}"
@@ -42,6 +52,9 @@ services:
       VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-0}"
       ENABLE_VLLM_GB10_PATCH: "${ENABLE_VLLM_GB10_PATCH:-0}"
       GB10_HYBRID_NVFP4_M_THRESHOLD: "${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}"
+      # 1 = do not apply the Issue #22 nvfp4_ds_mla decode hotfix at all.
+      DSPARK_SKIP_HOTFIX: "${DSPARK_SKIP_HOTFIX:-0}"
+      VLLM_PLUGINS: "${VLLM_PLUGINS:-}"
 
       VLLM_USE_FLASHINFER_SAMPLER: "${VLLM_USE_FLASHINFER_SAMPLER:-1}"
       VLLM_USE_BREAKABLE_CUDAGRAPH: "${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
@@ -87,6 +100,11 @@ services:
       # Checkpoint dspark_block_size is 5; k<5 truncates draft blocks (silent on 0.25.2 image).
       MTP_NUM_TOKENS: "${MTP_NUM_TOKENS:-5}"
       DEFAULT_THINKING: "${DEFAULT_THINKING:-low}"
+      # Empty = image default (FULL_AND_PIECEWISE). Set to PIECEWISE to give up the
+      # uniform-decode FULL graphs — the mitigation for the max-num-seqs 32 deadlock,
+      # where the first replay of the MAX_NUM_SEQS*(MTP+1)=128 FULL graph wedges both
+      # ranks. Valid: NONE, PIECEWISE, FULL, FULL_DECODE_ONLY, FULL_AND_PIECEWISE.
+      CUDAGRAPH_MODE: "${CUDAGRAPH_MODE:-}"
 
     command:
       - bash
@@ -98,16 +116,35 @@ services:
         export CUDAToolkit_ROOT="$${CUDAToolkit_ROOT:-$${CUDA_HOME}}";
         export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$${LD_LIBRARY_PATH:-}";
         ENCODING_SOURCE="$${DSPARK_ENCODING_FILE:-}";
+        if [ -z "$${ENCODING_SOURCE}" ]; then
+          MODEL_HUB_DIR=$$(printf '%s' "$${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}" | sed 's|/|--|g');
+          if [ -n "$${DSPARK_REVISION:-}" ] && [ -f "/cache/huggingface/hub/models--$${MODEL_HUB_DIR}/snapshots/$${DSPARK_REVISION}/encoding/encoding_dsv4.py" ]; then
+            ENCODING_SOURCE="/cache/huggingface/hub/models--$${MODEL_HUB_DIR}/snapshots/$${DSPARK_REVISION}/encoding/encoding_dsv4.py";
+          fi;
+          if [ -z "$${ENCODING_SOURCE}" ]; then
+            for candidate in /cache/huggingface/hub/models--$${MODEL_HUB_DIR}/snapshots/*/encoding/encoding_dsv4.py; do
+              if [ -f "$${candidate}" ]; then ENCODING_SOURCE="$${candidate}"; break; fi;
+            done;
+          fi;
+        fi;
         if [ -z "$${ENCODING_SOURCE}" ]; then for candidate in /cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/*/encoding/encoding_dsv4.py; do if [ -f "$${candidate}" ]; then ENCODING_SOURCE="$${candidate}"; break; fi; done; fi;
         if [ -z "$${ENCODING_SOURCE}" ] && [ -f /models/deepseek-ai/DeepSeek-V4-Flash-0731/encoding/encoding_dsv4.py ]; then ENCODING_SOURCE=/models/deepseek-ai/DeepSeek-V4-Flash-0731/encoding/encoding_dsv4.py; fi;
-        if [ -n "$${ENCODING_SOURCE}" ] && [ -f "$${ENCODING_SOURCE}" ]; then cp "$${ENCODING_SOURCE}" /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v4_encoding.py; python3 -c 'from pathlib import Path; p=Path("/usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v4.py"); s=p.read_text(); old="elif reasoning_effort in (\"max\", \"xhigh\"):\n                reasoning_effort = \"max\"\n            else:\n                reasoning_effort = \"high\""; new="elif reasoning_effort in (\"max\", \"xhigh\"):\n                reasoning_effort = \"max\"\n            elif reasoning_effort == \"high\":\n                reasoning_effort = \"high\"\n            else:\n                reasoning_effort = \"low\""; updated=s.replace(old,new); assert new in updated; p.write_text(updated)'; fi;
+        if [ -n "$${ENCODING_SOURCE}" ] && [ -f "$${ENCODING_SOURCE}" ]; then cp "$${ENCODING_SOURCE}" /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v4_encoding.py; python3 -c 'from pathlib import Path; p=Path("/usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v4.py"); s=p.read_text(); old="elif reasoning_effort in (\"max\", \"xhigh\"):\n                reasoning_effort = \"max\"\n            else:\n                reasoning_effort = \"high\""; new="elif reasoning_effort in (\"max\", \"xhigh\"):\n                reasoning_effort = \"max\"\n            elif reasoning_effort == \"high\":\n                reasoning_effort = \"high\"\n            else:\n                reasoning_effort = \"low\""; updated=s.replace(old,new); assert new in updated; p.write_text(updated)'; python3 /opt/hotfix-encoding-dsv4-issue21.py; fi;
+        if [ "$${DSPARK_SKIP_HOTFIX:-0}" != "1" ] && [ -f /opt/hotfix-nvfp4-ds-mla-issue22.sh ]; then bash /opt/hotfix-nvfp4-ds-mla-issue22.sh || echo "WARN: Issue #22 hotfix did not apply" >&2; fi;
         VLLM_QUANTIZATION_ARGS="";
         if [ "$${ENABLE_VLLM_GB10_PATCH:-0}" = "1" ]; then
           python3 -m pip install -e /opt/vllm-gb10-hybrid-nvfp4 --no-deps;
           export VLLM_PLUGINS="$${VLLM_PLUGINS:-gb10_hybrid_nvfp4}";
           VLLM_QUANTIZATION_ARGS="--quantization modelopt_gb10_hybrid";
         fi;
-        SPECULATIVE_CONFIG="{\"method\":\"dspark\",\"num_speculative_tokens\":$${MTP_NUM_TOKENS:-5},\"draft_sample_method\":\"probabilistic\"}";
+        SPEC_ARGS="--speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":$${MTP_NUM_TOKENS:-5},\"draft_sample_method\":\"probabilistic\"}";
+        if [ "$${MTP_NUM_TOKENS:-5}" = "0" ]; then
+          SPEC_ARGS="";
+        fi;
+        CUDAGRAPH_ARGS="";
+        if [ -n "$${CUDAGRAPH_MODE:-}" ]; then
+          CUDAGRAPH_ARGS="--compilation-config {\"cudagraph_mode\":\"$${CUDAGRAPH_MODE}\"}";
+        fi;
         case "$${DEFAULT_THINKING:-low}" in
           off) DEFAULT_CHAT_TEMPLATE_KWARGS='{"thinking":false}' ;;
           low) DEFAULT_CHAT_TEMPLATE_KWARGS='{"thinking":true,"reasoning_effort":"low"}' ;;
@@ -115,12 +152,16 @@ services:
           max) DEFAULT_CHAT_TEMPLATE_KWARGS='{"thinking":true,"reasoning_effort":"max"}' ;;
           *) echo "DEFAULT_THINKING must be one of: off, low, high, max (got: $${DEFAULT_THINKING})" >&2; exit 2 ;;
         esac;
-        exec /usr/local/bin/vllm serve ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}
+        REVISION_ARGS="";
+        if [ -n "$${DSPARK_REVISION:-}" ]; then REVISION_ARGS="--revision $${DSPARK_REVISION}"; fi;
+        exec /usr/local/bin/vllm serve ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}
+        $${REVISION_ARGS}
         --served-model-name ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}
         --host ${VLLM_HOST:-127.0.0.1}
         --port ${VLLM_PORT:-8888}
         --trust-remote-code
         $${VLLM_QUANTIZATION_ARGS}
+        $${CUDAGRAPH_ARGS}
         --tensor-parallel-size 2
         --pipeline-parallel-size 1
         --kv-cache-dtype nvfp4_ds_mla
@@ -134,7 +175,7 @@ services:
         --enable-prompt-tokens-details
         --async-scheduling
         --enable-chunked-prefill
-        --speculative-config "$${SPECULATIVE_CONFIG}"
+        $${SPEC_ARGS}
         --tokenizer-mode deepseek_v4
         --distributed-executor-backend mp
         --moe-backend flashinfer_b12x

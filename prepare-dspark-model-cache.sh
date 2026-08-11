@@ -4,6 +4,34 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env.dspark}"
 
+usage() {
+  cat <<'EOF'
+Usage: ./prepare-dspark-model-cache.sh [--official | --abliterated]
+
+Downloads the 0731 weights into HF_CACHE on this node, then on the worker.
+
+  --official      deepseek-ai/DeepSeek-V4-Flash-0731 (DSPARK_MODEL_OFFICIAL)
+  --abliterated   Keys abliterated weights (DSPARK_MODEL_ABLITERATED)
+
+With no flag, the checkpoint follows ABLITERATED / DSPARK_MODEL in .env.dspark,
+matching what start-deepseek-v4-flash-dspark.sh would serve.
+
+Downloading does not switch lanes: set ABLITERATED=1 in profiles/<p>/.env.local
+and restart to actually serve the abliterated weights.
+EOF
+}
+
+CLI_CHOICE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --official) CLI_CHOICE=0 ;;
+    --abliterated) CLI_CHOICE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
 if [ -f "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
@@ -15,7 +43,17 @@ if [ -n "${THIS_NODE_HF_CACHE:-}" ]; then
   HF_CACHE="$THIS_NODE_HF_CACHE"
 fi
 
-: "${DSPARK_MODEL:=deepseek-ai/DeepSeek-V4-Flash-DSpark}"
+DSPARK_MODEL_OFFICIAL="${DSPARK_MODEL_OFFICIAL:-deepseek-ai/DeepSeek-V4-Flash-0731}"
+DSPARK_MODEL_ABLITERATED="${DSPARK_MODEL_ABLITERATED:-drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32}"
+# CLI flag wins; otherwise mirror the launcher's resolution.
+ABLITERATED="${CLI_CHOICE:-${ABLITERATED:-0}}"
+if [ "$ABLITERATED" = "1" ]; then
+  DSPARK_MODEL="$DSPARK_MODEL_ABLITERATED"
+elif [ -n "$CLI_CHOICE" ] || [ -z "${DSPARK_MODEL:-}" ]; then
+  DSPARK_MODEL="$DSPARK_MODEL_OFFICIAL"
+fi
+export ABLITERATED DSPARK_MODEL
+echo "Preparing cache for: $DSPARK_MODEL (ABLITERATED=$ABLITERATED)"
 : "${HF_CACHE:=$HOME/.cache/huggingface}"
 : "${HF_DOWNLOAD_WORKERS:=1}"
 : "${DSPARK_VLLM_IMAGE:=vllm-dspark-runtime:dspark-nvfp4-stage-c}"
@@ -109,5 +147,11 @@ if [ "${PREPARE_WORKER:-1}" = "1" ]; then
   verify_worker_image
   scp "$SCRIPT_DIR/prepare-dspark-model-cache.sh" "${WORKER_HOST}:${WORKER_DIR}/prepare-dspark-model-cache.sh"
   scp "$ENV_FILE" "${WORKER_HOST}:${WORKER_DIR}/.env.dspark"
-  ssh "$WORKER_HOST" "cd '$WORKER_DIR' && chmod +x ./prepare-dspark-model-cache.sh && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS ENV_FILE='.env.dspark' THIS_NODE_HF_CACHE='$WORKER_HF_CACHE' PREPARE_WORKER=0 ./prepare-dspark-model-cache.sh"
+  # Pass the RESOLVED choice down as the CLI flag, not as env: the worker sources
+  # its own .env.dspark, which would overwrite an inherited ABLITERATED. Without
+  # this, --abliterated on the head with ABLITERATED=0 still in the env file
+  # would quietly fetch the official weights on the worker, leaving the two
+  # nodes disagreeing about what is cached.
+  if [ "$ABLITERATED" = "1" ]; then WORKER_CHOICE_FLAG=--abliterated; else WORKER_CHOICE_FLAG=--official; fi
+  ssh "$WORKER_HOST" "cd '$WORKER_DIR' && chmod +x ./prepare-dspark-model-cache.sh && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS ENV_FILE='.env.dspark' THIS_NODE_HF_CACHE='$WORKER_HF_CACHE' PREPARE_WORKER=0 ./prepare-dspark-model-cache.sh $WORKER_CHOICE_FLAG"
 fi

@@ -135,3 +135,106 @@ prefilling), detection was skipped and the code fell through to the rectangular
 GSM8K N=8 (200 Q) — the load that crashed pre-fix — now completes with **0 errors**,
 93.5% accuracy vs 95.0% sequential, **97.5% per-question agreement** (quality-neutral
 within batch FP-nondeterminism).
+
+---
+
+## Issue #21 — `encode_arguments_to_dsml` corrupts dict tool arguments
+
+### Symptom
+Multi-turn tool calling fails after the first successful tool turn: prior assistant
+tool calls are re-encoded into the prompt with a single wrapped `arguments`
+parameter instead of the real keys. The model then imitates that corrupt history.
+
+### Root cause
+HF checkpoint `encoding/encoding_dsv4.py` always does `json.loads(tool_call["arguments"])`.
+When `arguments` is already a `dict` (common in OpenAI-compatible replay),
+`json.loads` raises and the `except` path wraps it as `{"arguments": <dict>}`.
+
+Upstream: `deepseek-ai/DeepSeek-V4-Flash-0731` `encoding/encoding_dsv4.py` (same
+bug in the Keys abliterated snapshot). Not a vLLM recipe weights bug.
+
+### Fix
+Dispatch on type before parsing; keep the wrap only for non-JSON strings.
+Applied at container boot after encoder install via
+`patches/hotfix-encoding-dsv4-issue21.py` (mounted at
+`/opt/hotfix-encoding-dsv4-issue21.py`).
+
+### Test
+```bash
+python3 scripts/test-encoding-dsv4-issue21.py
+```
+
+---
+
+## Issue #22 — `nvfp4_ds_mla` long-context decode regression
+
+### Symptom
+With `--kv-cache-dtype nvfp4_ds_mla` (the recipe default), decode throughput
+drops to ~1 tok/s at 600K+ context, while `fp8_ds_mla` maintains ~17 tok/s at
+the same context length. Short-context throughput (~66 tok/s) is unaffected.
+
+### Root cause
+`flashmla_sparse.py` line 880 dispatches `nvfp4_ds_mla` to the slow
+`_forward_bf16_kv` kernel path instead of the fast `_forward_fp8_kv` path.
+The584-byte KV layout is identical for both dtypes on DSV4; only the kernel
+dispatch differs.
+
+```python
+# Line 880 in flashmla_sparse.py
+use_fp8_cache = self.kv_cache_dtype == "fp8_ds_mla"
+# nvfp4_ds_mla → False → slow _forward_bf16_kv (~1 tok/s at 600K)
+# fp8_ds_mla   → True  → fast _forward_fp8_kv (~17 tok/s at 600K)
+```
+
+### Fix
+```python
+use_fp8_cache = self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
+```
+
+### Hotfix for running containers
+```bash
+docker exec <container> bash /path/to/hotfix-nvfp4-ds-mla-issue22.sh
+# Then restart the vLLM process inside the container.
+```
+
+### File changed
+| file | change |
+|---|---|
+| `v1/attention/backends/mla/flashmla_sparse.py` | `use_fp8_cache` check: include `nvfp4_ds_mla` |
+
+---
+
+## Local deviations from upstream (this checkout)
+
+Synced from `MiaAI-Lab/main` on 2026-08-11. Two intentional differences:
+
+1. **Issue #22 is applied by the compose entrypoint, not post-start.** Upstream
+   brings both ranks up, patches the running containers, then `restart`s them —
+   which pays a second weight load (~105 s/rank) on every cold bring-up and
+   every `deepseek-restart`. Here `docker-compose.dspark.yml` bind-mounts
+   `patches/hotfix-nvfp4-ds-mla-issue22.sh` to `/opt/` and runs it before
+   `exec vllm serve`, so the patch lands before vLLM imports
+   `flashmla_sparse.py` and no restart is needed. Upstream's path is still in
+   `start-deepseek-v4-flash-dspark.sh`, dormant behind
+   `DSPARK_HOTFIX_VIA_COMPOSE=0`. `DSPARK_SKIP_HOTFIX=1` disables both.
+   Both ranks need the file: `start-deepseek-v4-flash-dspark.sh` scp's it into
+   the worker's `patches/` dir, because an absent bind source makes docker mount
+   an empty directory and that rank runs unpatched with only a WARN in the log.
+
+2. **Issue #21 is a CHECKPOINT regression, not an image bug — so it applies to
+   the 0731 lane only.** Verified 2026-08-11 against
+   `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`: the encoder shipped *in the image*
+   already dispatches on type correctly (`if isinstance(arguments, str):
+   json.loads(...) else: use as-is`). The bug arrives with the checkpoint's
+   `encoding/encoding_dsv4.py`, which the 0731 compose copies **over** that good
+   file at boot — the lane downgrades a correct encoder and then repairs it.
+   `profiles/dspark/` has no encoder-copy step, keeps the image's correct
+   version, and therefore does NOT mount the #21 hotfix; doing so would only log
+   `[WARN] ... pattern not found` on every boot. Issue #22 IS mounted there,
+   since that lane also serves `--kv-cache-dtype nvfp4_ds_mla`.
+
+3. **Vision is not ported.** Upstream's VL sidecar, MoonViT plugin,
+   `dspark_vision_mcp` and projector-finetune tooling are deliberately absent —
+   images are handled outside this lane (CLIProxyAPI / Hermes), and the sidecar
+   would take GPU memory this endpoint needs. Nothing here references
+   `ENABLE_VL_SIDECAR`; the 0731 profile stays text-only.

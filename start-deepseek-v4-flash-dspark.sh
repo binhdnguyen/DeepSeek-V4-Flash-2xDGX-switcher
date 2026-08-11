@@ -79,6 +79,25 @@ set -a
 source "$ENV_FILE"
 set +a
 
+# Checkpoint flag: official 0731 vs Keys abliterated weights (upstream 801db32).
+#   ABLITERATED=1 → DSPARK_MODEL_ABLITERATED (overrides DSPARK_MODEL)
+#   ABLITERATED=0 → whatever DSPARK_MODEL the env file sets, else
+#                   DSPARK_MODEL_OFFICIAL. Deviates from upstream, which forces
+#                   DSPARK_MODEL=OFFICIAL and would silently repoint any profile
+#                   naming a different checkpoint (the retired dspark lane).
+# Also unlike upstream, GPU_MEMORY_UTILIZATION is NOT derived from a flag here:
+# it stays whatever the profile sets (0.80 for 0731). Upstream's 0.835 text-mode
+# default is the other half of its VL-sidecar memory budget, which this checkout
+# does not run.
+DSPARK_MODEL_OFFICIAL="${DSPARK_MODEL_OFFICIAL:-deepseek-ai/DeepSeek-V4-Flash-0731}"
+DSPARK_MODEL_ABLITERATED="${DSPARK_MODEL_ABLITERATED:-drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32}"
+if [ "${ABLITERATED:-0}" = "1" ]; then
+  DSPARK_MODEL="${DSPARK_MODEL_ABLITERATED}"
+elif [ -z "${DSPARK_MODEL:-}" ]; then
+  DSPARK_MODEL="${DSPARK_MODEL_OFFICIAL}"
+fi
+export ABLITERATED DSPARK_MODEL DSPARK_MODEL_OFFICIAL DSPARK_MODEL_ABLITERATED
+
 # CLI values have highest precedence; the env file remains the persistent
 # configuration source when no command-line override is provided.
 VLLM_HOST="${CLI_VLLM_HOST:-${VLLM_HOST:-127.0.0.1}}"
@@ -321,6 +340,7 @@ compose_base() {
     VLLM_HOST="$VLLM_HOST" \
     VLLM_PORT="$VLLM_PORT" \
     VLLM_HOST_IP="$VLLM_HOST_IP" \
+    DSPARK_MODEL="$DSPARK_MODEL" \
     ENABLE_VLLM_GB10_PATCH="$ENABLE_VLLM_GB10_PATCH" \
     VLLM_GB10_PATCH_DIR="$VLLM_GB10_PATCH_DIR" \
     GB10_HYBRID_NVFP4_M_THRESHOLD="${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}" \
@@ -377,6 +397,8 @@ print_resolved_profile() {
   echo "Resolved DSpark profile:"
   echo "  project: $PROJECT_NAME"
   echo "  image: $DSPARK_VLLM_IMAGE"
+  echo "  checkpoint: $DSPARK_MODEL (ABLITERATED=${ABLITERATED:-0})"
+  echo "  revision: ${DSPARK_REVISION:-<cache default>}"
   echo "  model: ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}"
   echo "  served model: ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"
   echo "  max model len: ${MAX_MODEL_LEN:-1000000}"
@@ -398,6 +420,15 @@ print_resolved_profile() {
   echo "  worker dir: $WORKER_DIR"
   echo "  worker cache: ${WORKER_HF_CACHE:-${HF_CACHE:-}}"
   echo "  GB10 vLLM patch: $ENABLE_VLLM_GB10_PATCH"
+  if [ "${DSPARK_SKIP_HOTFIX:-0}" = "1" ]; then
+    echo "  Issue #22 hotfix: SKIPPED (DSPARK_SKIP_HOTFIX=1)"
+  elif [ ! -f "$SCRIPT_DIR/patches/hotfix-nvfp4-ds-mla-issue22.sh" ]; then
+    echo "  Issue #22 hotfix: not found"
+  elif [ "${DSPARK_HOTFIX_VIA_COMPOSE:-1}" = "1" ]; then
+    echo "  Issue #22 hotfix: applied by compose entrypoint (no restart)"
+  else
+    echo "  Issue #22 hotfix: will apply post-start, then restart both ranks"
+  fi
   if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ]; then
     echo "  GB10 vLLM patch dir: $VLLM_GB10_PATCH_DIR"
     echo "  GB10 hybrid NVFP4 M threshold: ${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}"
@@ -408,7 +439,7 @@ validate_compose() {
   echo "Validating head compose config..."
   compose_base 0 "" config --quiet
   echo "Validating worker compose config..."
-  remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml config --quiet"
+  remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' DSPARK_MODEL='$DSPARK_MODEL' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml config --quiet"
 }
 
 need_cmd docker
@@ -473,6 +504,23 @@ scp "$COMPOSE_FILE" "${WORKER_HOST}:${REMOTE_COMPOSE_FILE}"
 scp "$ENV_FILE" "${WORKER_HOST}:${REMOTE_ENV_FILE}"
 ssh "$WORKER_HOST" "mkdir -p $REMOTE_WORKER_DIR/recipe/vllm/v1/spec_decode"
 scp "$DSPARK_PROPOSER_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/recipe/vllm/v1/spec_decode/dspark_proposer.py"
+# Both hotfixes are bind-mounted by docker-compose.dspark.yml from ./patches/,
+# resolved against the worker's compose dir — so rank 1 needs its own copies or
+# docker silently mounts an empty directory and that rank runs unpatched.
+DSPARK_HOTFIX_FILE="$SCRIPT_DIR/patches/hotfix-nvfp4-ds-mla-issue22.sh"
+DSPARK_ENCODING_ISSUE21_HOTFIX="${DSPARK_ENCODING_ISSUE21_HOTFIX:-$SCRIPT_DIR/patches/hotfix-encoding-dsv4-issue21.py}"
+if [ -f "$DSPARK_HOTFIX_FILE" ] || [ -f "$DSPARK_ENCODING_ISSUE21_HOTFIX" ]; then
+  echo "Syncing vLLM hotfixes to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+fi
+if [ -f "$DSPARK_HOTFIX_FILE" ]; then
+  scp "$DSPARK_HOTFIX_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-nvfp4-ds-mla-issue22.sh"
+  # Upstream's post-start path (DSPARK_HOTFIX_VIA_COMPOSE=0) reads it here.
+  scp "$DSPARK_HOTFIX_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/hotfix-nvfp4-ds-mla-issue22.sh"
+fi
+if [ -f "$DSPARK_ENCODING_ISSUE21_HOTFIX" ]; then
+  scp "$DSPARK_ENCODING_ISSUE21_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-encoding-dsv4-issue21.py"
+fi
 if [ "$ENABLE_VLLM_GB10_PATCH" = "1" ]; then
   echo "Syncing GB10 vLLM patch to ${WORKER_HOST}:${WORKER_DIR}/vllm_patch_gb10"
   tar -C "$VLLM_GB10_PATCH_DIR" \
@@ -484,10 +532,41 @@ fi
 validate_compose
 
 echo "Starting DSpark worker on ${WORKER_HOST}..."
-remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml up -d"
+remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' DSPARK_MODEL='$DSPARK_MODEL' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml up -d"
 
 echo "Starting DSpark head..."
 compose_base 0 "" up -d
+
+# ---- Apply Issue #22 hotfix (nvfp4_ds_mla long-context decode) ----
+# Upstream's path: patch vLLM inside the already-running containers, then
+# restart them so the patched files take effect.  Idempotent, but it costs a
+# second weight load (~105 s/rank) on every bring-up.
+#
+# Locally the compose entrypoint applies the same patch BEFORE vLLM is
+# imported, so this block is dormant by default.  Set
+# DSPARK_HOTFIX_VIA_COMPOSE=0 to fall back to upstream's behaviour (e.g. with a
+# compose file that has no hotfix mount).  DSPARK_SKIP_HOTFIX=1 disables both.
+DSPARK_HOTFIX_FILE="$SCRIPT_DIR/patches/hotfix-nvfp4-ds-mla-issue22.sh"
+if [ "${DSPARK_SKIP_HOTFIX:-0}" != "1" ] && [ "${DSPARK_HOTFIX_VIA_COMPOSE:-1}" != "1" ] && [ -f "$DSPARK_HOTFIX_FILE" ]; then
+  echo "Applying Issue #22 hotfix (nvfp4_ds_mla long-context decode fix)..."
+  # Head container
+  if docker ps --format '{{.Names}}' | grep -qx "${PROJECT_NAME}-vllm-dspark-1"; then
+    docker cp "$DSPARK_HOTFIX_FILE" "${PROJECT_NAME}-vllm-dspark-1:/tmp/hotfix-nvfp4-ds-mla-issue22.sh"
+    docker exec "${PROJECT_NAME}-vllm-dspark-1" bash /tmp/hotfix-nvfp4-ds-mla-issue22.sh || true
+  fi
+  # Worker container (via SSH)
+  REMOTE_HOTFIX="${REMOTE_WORKER_DIR}/hotfix-nvfp4-ds-mla-issue22.sh"
+  ssh "$WORKER_HOST" "if [ -f '$REMOTE_HOTFIX' ]; then docker ps --format '{{.Names}}' | grep -qx '${PROJECT_NAME}-vllm-dspark-1' && docker cp '$REMOTE_HOTFIX' '${PROJECT_NAME}-vllm-dspark-1:/tmp/hotfix-nvfp4-ds-mla-issue22.sh' && docker exec '${PROJECT_NAME}-vllm-dspark-1' bash /tmp/hotfix-nvfp4-ds-mla-issue22.sh; fi" || true
+  # Restart both containers so vLLM picks up the patched files
+  echo "Restarting DSpark containers to apply hotfix..."
+  remote_compose "NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' DSPARK_MODEL='$DSPARK_MODEL' ENABLE_VLLM_GB10_PATCH='$ENABLE_VLLM_GB10_PATCH' VLLM_GB10_PATCH_DIR='./vllm_patch_gb10' GB10_HYBRID_NVFP4_M_THRESHOLD='${GB10_HYBRID_NVFP4_M_THRESHOLD:-128}' docker compose -p '$PROJECT_NAME' --env-file .env.dspark -f docker-compose.dspark.yml restart vllm-dspark" || true
+  compose_base 0 "" restart vllm-dspark || true
+  echo "Hotfix applied and containers restarted."
+else
+  if [ "${DSPARK_SKIP_HOTFIX:-0}" = "1" ]; then
+    echo "Skipping Issue #22 hotfix (DSPARK_SKIP_HOTFIX=1)."
+  fi
+fi
 
 echo "Waiting for DSpark vLLM API..."
 print_initial_startup_logs
