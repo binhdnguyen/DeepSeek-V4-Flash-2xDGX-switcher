@@ -5,7 +5,9 @@
 # switch-deepseek-v4-flash.sh, safe to publish. Real cluster addresses go in
 # profiles/<name>/.env.local, which stays local, as does the active .env.dspark.
 !profiles/*/.env
+!profiles/*/profile.env
 profiles/*/.env.local
+.profile-state
 .secrets/
 *.pem
 *.key
@@ -23,3 +25,10 @@ benchmarks/
 RESULTS.md
 scripts/agent_sanity_bench.py
 scripts/capture_runtime.sh
+
+/.worktrees/
+# Timestamped local backups. These are copies of live config and routinely hold
+# real IPs, home paths and node names — profiles/*/.env.local is ignored but
+# profiles/*/.env.local.bak-* was NOT, and one `git add -A` swept it into a
+# commit for a public repo (caught 2026-08-11 by the pre-push scan).
+*.bak-*

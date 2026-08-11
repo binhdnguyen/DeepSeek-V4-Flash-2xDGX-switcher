@@ -1,140 +1,147 @@
-# Switch Models: DeepSeek-V4-Flash 0731 ↔ DSpark (port 8888)
+# Switch DeepSeek V4 Flash profiles on port 8888
 
-**Date:** 2026-08-01 — re-created as a clean guide (was SWITCH-v026, model-set changed).
-**Scope:** Alternate the shared 2x DGX-Spark vLLM endpoint on **0.0.0.0:8888** between
-the two cached checkpoints. Everything below is verified against the live deployment.
+One repository controls one shared two-node endpoint. Run everything from the
+repository root.
 
 ## Profiles
 
-Two canonical config pairs live under `profiles/` (seeded from the last-known-good
-config + the `bak-before-0731` files).
+| Profile | Runtime / checkpoint | Served model |
+|---|---|---|
+| `0731` | Anemll Compose runtime, `deepseek-ai/DeepSeek-V4-Flash-0731` | `deepseek-v4-flash-0731` |
+| `dspark` | Anemll Compose runtime, original DSpark checkpoint | `deepseek-v4-flash-dspark` |
 
-> **Real cluster values live in `profiles/<name>/.env.local`.** The tracked
-> `.env` is a placeholder template (`head-roce-ip`, `rocepXsYfZ`,
-> `${HOME}/.cache/huggingface`) so this repo can stay public. The switcher
-> prefers `.env.local` when present and refuses to deploy a profile whose
-> addresses are still placeholders. On a fresh clone:
->
-> ```bash
-> cp profiles/0731/.env profiles/0731/.env.local   # then fill in real values
-> cp profiles/dspark/.env profiles/dspark/.env.local
-> ```
+`0731` is the default lane. Toggle order is `0731 -> dspark -> 0731`.
 
-| Profile | Checkpoint (root) | Served names | MTP / flags |
-|---|---|---|---|
-| `0731` | `deepseek-ai/DeepSeek-V4-Flash-0731` (156G) | `deepseek-v4-flash-0731` **+** `deepseek-v4-flash-dspark` | MTP 5, `DEFAULT_THINKING=low`, `--enable-prompt-tokens-details`, encoding bootstrap |
-| `dspark` | `deepseek-ai/DeepSeek-V4-Flash-DSpark` (161G) | `deepseek-v4-flash-dspark` | MTP 3, thinking off, `restart: unless-stopped` |
+Profiles are **discovered from the `profiles/` directory** — any directory
+containing a `profile.env` is a profile — so adding or removing one needs no
+edit to the switcher or its library.
 
-The `0731` profile's `docker-compose.dspark.yml` is **byte-identical to
-MiaAI-Lab `upstream/main`**, and its `.env` follows the upstream recipe
-(`MTP_NUM_TOKENS=5`, `DEFAULT_THINKING=low`, `VLLM_USE_BREAKABLE_CUDAGRAPH=0`).
-Only cluster-specific values differ — addresses, cache paths, RoCE interfaces —
-plus the additive `deepseek-v4-flash-dspark` alias in `SERVED_MODEL_NAME`.
-`start-deepseek-v4-flash-dspark.sh` is byte-identical to upstream as well.
-
-> **`MTP_NUM_TOKENS=5` is upstream's default, not this cluster's fastest.**
-> `BENCHMARK-0731-vs-DSpark-20260801.md` measured K=3 at 42.35 tok/s vs K=5 at
-> 39.48 (−11.7% at c1): accepted tokens per draft are ~flat (0.319×5 ≈ 0.530×3)
-> while each K=5 verify step costs more. The profile keeps 5 for recipe parity;
-> set `MTP_NUM_TOKENS=3` in `profiles/0731/.env` to restore the benchmarked
-> optimum.
-
-Both share the same runtime image `ghcr.io/anemll/dspark-vllm-gx10:0.1.1`
-(same digest on head + worker), `--kv-cache-dtype nvfp4_ds_mla`, TP=2, 1M ctx,
-`--moe-backend flashinfer_b12x`, DSpark speculative decoding.
-
-> Note: **weights** are FP8-E4M3 (see `config.json` `"quant_method":"fp8"`).
-> "NVFP4" in this repo = the *KV-cache* dtype (`nvfp4_ds_mla`), not the weights,
-> and is unrelated to `nvidia/DeepSeek-V4-Flash-NVFP4`.
-
-## Prerequisites (already in place)
-
-- Both checkpoints cached on **head and worker**:
-  `$HF_CACHE/hub/models--deepseek-ai--DeepSeek-V4-Flash-{0731,DSpark}`
-- Runtime image present on both nodes.
-- Passwordless SSH head → `$WORKER_HOST` for worker sync.
-- Client **routing** is unaffected: both profiles serve the model name
-  `deepseek-v4-flash-dspark`, so `~/.omp/agent/models.yml` / `config.yml`
-  (`dspark/deepseek-v4-flash-dspark:high`) stay untouched.
-- Client **output** is not identical across the two lanes: `0731` defaults to
-  `DEFAULT_THINKING=low` (`{"thinking":true,"reasoning_effort":"low"}`, upstream's
-  recipe default) so responses carry reasoning content, while `dspark` pins
-  `{"thinking":false}`. Request-level overrides win on both. Pin
-  `DEFAULT_THINKING=off` in `profiles/0731/.env` if you need the lanes to behave
-  the same.
+Real cluster values live in ignored `profiles/<name>/.env.local` files. The
+tracked `profiles/<name>/.env` templates ship placeholders and must stay
+sanitized; the switcher refuses to deploy a profile whose env still contains
+them.
 
 ## Commands
 
-Run from the repo root:
-
 ```bash
-cd ~/ai/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark
+# List targets (discovered from profiles/)
+./switch-deepseek-v4-flash.sh --profiles
 
-# Current state + readiness (read-only)
+# Read state, served identity, and request counters
 ./switch-deepseek-v4-flash.sh --check
 
-# Dry-run a switch without touching anything
-./switch-deepseek-v4-flash.sh --dry-run dspark
+# Validate all prerequisites without changing the endpoint
+./switch-deepseek-v4-flash.sh --dry-run 0731
 
-# Switch to the OLD DSpark weights
+# Explicit switches
+./switch-deepseek-v4-flash.sh 0731
 ./switch-deepseek-v4-flash.sh dspark
 
-# Switch to the NEW 0731 weights
-./switch-deepseek-v4-flash.sh 0731
-
-# Bare invocation toggles to whichever is NOT active
-./switch-deepseek-v4-flash.sh
+# Advance once in toggle order
+./switch-deepseek-v4-flash.sh toggle
 ```
 
-## What a switch does
+The active profile name is stored in `.profile-state`. This state changes only
+after the target start and profile-specific verification both succeed. It is a
+control-plane record, not proof that an endpoint is currently live; always use
+`--check` and the profile verifier after an interrupted operation.
 
-1. `stop-deepseek-v4-flash-dspark.sh` — `docker compose down` head + worker
-   (project `deepseek-v4-flash`).
-2. Copy `profiles/<name>/.env` → `.env.dspark` and
-   `profiles/<name>/docker-compose.dspark.yml` → `docker-compose.dspark.yml`.
-3. `start-deepseek-v4-flash-dspark.sh` — syncs compose/env/proposer to worker,
-   auto-resolves RoCEv2 GID indexes per node, boots both nodes, waits for the API
-   and runs a `Reply with OK` smoke test.
-4. Re-queries `/v1/models` to confirm the served identity.
+## Safety and rollback
 
-A switch takes **~6 min** with a warm FlashInfer autotune cache (measured
-2026-08-01: 367 s end-to-end, 0731 → dspark; weights load 216 s, engine init
-81 s), up to **~10 min** cold when TileLang/DeepGEMM/FlashInfer must recompile.
-The endpoint is down for the whole switch.
+Before a real switch:
 
-## Verify
+1. Confirm no client has a non-final batch run in flight.
+2. Confirm there is no unmanaged translation/benchmark process.
+3. Require `vllm:num_requests_running=0` and `vllm:num_requests_waiting=0`.
+4. Ensure each client is configured for the target's distinct served ID —
+   `deepseek-v4-flash-0731` or `deepseek-v4-flash-dspark`. A switch does not
+   rewrite external client settings automatically.
+
+The switcher refuses a switch when live vLLM metrics report active requests, and
+also refuses when the API is live but metrics are unavailable or malformed. An
+endpoint that is fully down remains recoverable. If target start or verification
+fails, it stops the failed target and attempts to start and verify the prior
+profile. Do not edit `.profile-state` manually unless recovering from an
+independently verified manual start.
+
+> [!WARNING]
+> `--check` reporting `port 8888: LISTEN` is **not** a health signal. On a 2-node
+> deployment the head's rank-0 keeps answering `/v1/models` with the correct
+> `root=` even when the worker is gone and no forward pass is possible. Only the
+> profile verifier, which issues a real completion, distinguishes the two. See
+> [docs/BOOT-AND-RECOVERY.md](docs/BOOT-AND-RECOVERY.md).
+
+## Profile verification
 
 ```bash
 ./switch-deepseek-v4-flash.sh --check
-# port 8888 : LISTEN
-#   deepseek-v4-flash-dspark  root=deepseek-ai/DeepSeek-V4-Flash-DSpark   <- DSpark active
-#   deepseek-v4-flash-dspark  root=deepseek-ai/DeepSeek-V4-Flash-0731     <- 0731 active
-
-curl -s http://127.0.0.1:8888/v1/models | jq '.data[].root'
+profiles/0731/verify.sh       # when 0731 is active
+profiles/dspark/verify.sh     # when dspark is active
 ```
 
-## Rollback / troubleshooting
+Each verifier asserts the served `root=` matches the profile's `EXPECTED_ROOT`
+**and** completes a real chat request. Verify by `root=`, never by served name:
+a profile may serve aliases, so the name alone cannot tell two checkpoints apart.
 
-- Failed start? The switch script surfaces head+worker container logs.
-  Quick manual rollback:
-  ```bash
-  ./stop-deepseek-v4-flash-dspark.sh
-  cp profiles/0731/.env .env.dspark && cp profiles/0731/docker-compose.dspark.yml docker-compose.dspark.yml
-  ./start-deepseek-v4-flash-dspark.sh
-  ```
-- RoCEv2 GID resolution is automatic (`NCCL_IB_GID_AUTO=1`); only pin
-  `NCCL_IB_GID_INDEX` / `WORKER_NCCL_IB_GID_INDEX` manually if auto fails.
-- `-0731` needs its `encoding/encoding_dsv4.py`; the compose bootstrap copies it
-  automatically. Do **not** remove the `DSPARK_ENCODING_FILE` handling in `profiles/0731`.
-- Profiles are the source of truth for a switch. To capture a tuned live config as
-  a new baseline, copy `.env.dspark` + `docker-compose.dspark.yml` back into the
-  matching `profiles/<name>/` before switching away.
+## Matched benchmarks
 
-## Files
+Systems benchmark (same prompt and fixed output lengths for every profile):
 
-- `switch-deepseek-v4-flash.sh` — toggle/check/dry-run driver.
-- `profiles/0731/{.env,docker-compose.dspark.yml}` — new-weights config.
-- `profiles/dspark/{.env,docker-compose.dspark.yml}` — old-weights config.
-- `profiles/*/.env.local` — real cluster values, gitignored, wins over `.env`.
-- `.env.dspark` / `docker-compose.dspark.yml` — the **active** config (what the
-  running endpoint used at launch).
+```bash
+OUT=/tmp/profile-compare-$(date -u +%Y%m%dT%H%M%SZ)
+python3 scripts/run_matched_profile_benchmark.py \
+  --profile 0731 \
+  --base-url http://127.0.0.1:8888 \
+  --model deepseek-v4-flash-0731 \
+  --output "$OUT/0731/systems.json"
+```
+
+It runs one warm-up, five C1 repeats at 2,048 output tokens, and two rounds each
+at C1/C2/C4/C6 with 512 tokens, temperature zero and `ignore_eos=true`.
+
+Translation replay uses the frozen eight-file selection in
+`tests/fixtures/translation-profile-prompts.json`:
+
+```bash
+python3 scripts/run_translation_profile_benchmark.py \
+  --profile 0731 \
+  --model deepseek-v4-flash-0731 \
+  --cache-dir /path/to/your/prompt-cache-directory \
+  --selection tests/fixtures/translation-profile-prompts.json \
+  --output "$OUT/0731/translation.json"
+```
+
+Run identical commands after switching profiles, changing only `--profile`,
+`--model` and the output directory. Reject a comparison if prompt hashes, token
+limits, temperature, concurrency, or frozen file selection differ.
+
+### Choosing `MTP_NUM_TOKENS`
+
+`0731` ships `MTP_NUM_TOKENS=3`, not the upstream recipe's 5. At K=5 aggregate
+throughput is a dead heat while draft acceptance falls 0.681 → 0.516 — more
+draft compute discarded for no gain.
+
+Speculative decoding is distribution-preserving, so **K cannot change token
+counts at all**. Any token or wall-clock difference between K runs is sampling
+noise, and acceptance rate is the low-variance measure. Isolate K with
+fixed-token runs (`ignore_eos`); that methodology is right for K and for decode
+rate, but it structurally cannot see token-count differences, which is what
+dominates real batch wall-clock.
+
+## Troubleshooting
+
+- **"Startup failed" is often wrong.** The start script's readiness probe is too
+  short for a cold start with TileLang/DeepGEMM/FlashInfer recompiles; it prints
+  that message and exits nonzero while the engine is seconds from ready. Confirm
+  against the API, not the exit code. Because profile files are copied *before*
+  start, a "failed" switch has still changed the active config.
+- A first cold boot can spend several minutes loading weights, warming TileLang
+  kernels and autotuning FlashInfer before port 8888 listens. Weights alone take
+  ~105 s.
+- Hugging Face snapshots contain relative symlinks into their repository
+  `blobs/` directory. Mount the whole model repository root, not just the
+  snapshot, or `config.json` and shard symlinks break inside the container.
+- Changing only `MTP_NUM_TOKENS` will **not** trigger a reload: the switcher
+  exits "already active" when the target is loaded. Edit the active env and
+  cycle the lane directly, then confirm K in the live process rather than in the
+  env file.
