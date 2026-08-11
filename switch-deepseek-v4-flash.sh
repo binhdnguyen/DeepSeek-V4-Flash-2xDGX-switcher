@@ -10,18 +10,20 @@ METRICS_URL="${METRICS_URL:-http://127.0.0.1:8888/metrics}"
 source "$SCRIPT_DIR/scripts/profile_switch_lib.sh"
 
 usage() {
-  cat <<'EOF'
+  local names
+  names="$(profile_names | paste -sd'|' -)"
+  cat <<EOF
 Usage:
   switch-deepseek-v4-flash.sh --profiles
   switch-deepseek-v4-flash.sh --check
-  switch-deepseek-v4-flash.sh --dry-run [0731|dspark|robolab]
-  switch-deepseek-v4-flash.sh [0731|dspark|robolab|toggle]
+  switch-deepseek-v4-flash.sh --dry-run [${names}]
+  switch-deepseek-v4-flash.sh [${names}|toggle]
 EOF
 }
 
-valid_profile() {
-  case "$1" in 0731|dspark|robolab) return 0 ;; *) return 1 ;; esac
-}
+# Valid targets come from what is on disk (see profile_names), so a checkout that
+# ships a different set of profiles needs no edit here.
+valid_profile() { profile_exists "$1"; }
 
 probe() { curl -fsS --max-time 5 "$API_URL" 2>/dev/null || true; }
 
@@ -40,16 +42,20 @@ check_state() {
   else
     printf '%s\n' 'port 8888      : free or API unavailable'
   fi
-  local running waiting
-  read -r running waiting < <(requests_in_flight)
-  printf 'requests       : running=%s waiting=%s\n' "$running" "$waiting"
+  local running waiting response
+  if response="$(requests_in_flight)"; then
+    read -r running waiting <<<"$response"
+    printf 'requests       : running=%s waiting=%s\n' "$running" "$waiting"
+  else
+    printf '%s\n' 'requests       : unavailable'
+  fi
 }
 
 validate_target() {
   local target="$1" env_file
   validate_profile_layout "$target"
   env_file="$(profile_env "$target")"
-  if grep -qE '^(MASTER_ADDR|WORKER_HOST|ROBOLAB_CHECKOUT)=(head-roce-ip|worker-host-or-roce-ip|/path/to/)' "$env_file" 2>/dev/null; then
+  if grep -qE '^(MASTER_ADDR|WORKER_HOST)=(head-roce-ip|worker-host-or-roce-ip|/path/to/)' "$env_file" 2>/dev/null; then
     printf 'error: %s contains placeholder cluster values\n' "$env_file" >&2
     return 1
   fi
@@ -86,19 +92,24 @@ case "$cmd" in
     activate_profile "$target" "$active"
     printf 'DONE: active profile = %s\n' "$target"
     ;;
-  0731|dspark|robolab)
+  *)
+    # Any name that matches a profile on disk is a switch target; everything
+    # else is a usage error. Kept as the default branch so the accepted set is
+    # defined solely by profile_names.
+    if ! valid_profile "$cmd"; then
+      printf 'error: unknown command %s\n' "$cmd" >&2
+      usage >&2
+      exit 2
+    fi
     active="$(active_profile)"
     if [[ "$cmd" == "$active" ]]; then
-      printf 'already active: %s\n' "$cmd"
+      validate_target "$cmd"
+      run_profile_adapter "$cmd" verify
+      printf 'already active and verified: %s\n' "$cmd"
       exit 0
     fi
     validate_target "$cmd"
     activate_profile "$cmd" "$active"
     printf 'DONE: active profile = %s\n' "$cmd"
-    ;;
-  *)
-    printf 'error: unknown command %s\n' "$cmd" >&2
-    usage >&2
-    exit 2
     ;;
 esac
