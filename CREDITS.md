@@ -89,3 +89,7 @@ The vLLM overlay files and `patches/keys-concurrency.patch` are vLLM/DSpark
 derived and retain their Apache-2.0 lineage from the upstream sources and
 Keys' patch repo. Model weights, base images, CUDA/NCCL, FlashInfer, TileLang,
 and Triton are separate upstream artifacts with their own licenses and terms.
+
+**[@u1tra_instinct](https://x.com/u1tra_instinct)** — special thanks for the
+optional abliterated weights path (`ABLITERATED=1`):
+https://huggingface.co/drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32

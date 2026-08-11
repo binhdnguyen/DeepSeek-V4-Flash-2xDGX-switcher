@@ -20,6 +20,17 @@ set -a
 source "$ENV_FILE"
 set +a
 
+# Mirror start-deepseek-v4-flash-dspark.sh's checkpoint resolution, or this
+# script would report a different model than the one that actually gets served.
+DSPARK_MODEL_OFFICIAL="${DSPARK_MODEL_OFFICIAL:-deepseek-ai/DeepSeek-V4-Flash-0731}"
+DSPARK_MODEL_ABLITERATED="${DSPARK_MODEL_ABLITERATED:-drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32}"
+if [ "${ABLITERATED:-0}" = "1" ]; then
+  DSPARK_MODEL="${DSPARK_MODEL_ABLITERATED}"
+elif [ -z "${DSPARK_MODEL:-}" ]; then
+  DSPARK_MODEL="${DSPARK_MODEL_OFFICIAL}"
+fi
+export DSPARK_MODEL
+
 : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE}"
 : "${MASTER_ADDR:?MASTER_ADDR must be set in $ENV_FILE}"
 : "${MASTER_PORT:?MASTER_PORT must be set in $ENV_FILE}"
@@ -29,7 +40,8 @@ echo "DSpark config:"
 echo "  worker: ${WORKER_HOST}"
 echo "  master: ${MASTER_ADDR}:${MASTER_PORT}"
 echo "  image: ${DSPARK_VLLM_IMAGE}"
-echo "  model: ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}"
+echo "  checkpoint: ${DSPARK_MODEL} (ABLITERATED=${ABLITERATED:-0})"
+echo "  revision: ${DSPARK_REVISION:-<cache default>}"
 echo "  served model: ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"
 echo "  max model len: ${MAX_MODEL_LEN:-1048576}"
 echo "  max num seqs: ${MAX_NUM_SEQS:-6}"
@@ -45,5 +57,6 @@ echo
 echo "Rendered vLLM command:"
 env -u MASTER_PORT -u NODE_RANK -u HEADLESS -u WORKER_HOST -u MASTER_ADDR \
   COMPOSE_DISABLE_ENV_FILE=1 \
+  DSPARK_MODEL="$DSPARK_MODEL" \
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config \
-  | grep -E -- '--max-model-len|--max-num-seqs|--max-num-batched-tokens|--max-cudagraph-capture-size|--gpu-memory-utilization|--master-port|--kv-cache-dtype|--speculative-config|--async-scheduling|--enable-chunked-prefill|--generation-config|image:|VLLM_USE_B12X_WO_PROJECTION|VLLM_USE_FLASHINFER_SAMPLER|MTP_NUM_TOKENS'
+  | grep -E -- '--revision|--max-model-len|--max-num-seqs|--max-num-batched-tokens|--max-cudagraph-capture-size|--gpu-memory-utilization|--master-port|--kv-cache-dtype|--speculative-config|--async-scheduling|--enable-chunked-prefill|--generation-config|image:|VLLM_USE_B12X_WO_PROJECTION|VLLM_USE_FLASHINFER_SAMPLER|MTP_NUM_TOKENS'
