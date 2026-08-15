@@ -24,3 +24,11 @@ start-deepseek-v4-flash-dspark-gb10.sh
 plugins/dspark_vision_mcp/.venv/
 plugins/dspark_vision_mcp/build/
 plugins/dspark_vision_mcp/**/__pycache__/
+
+# Switcher profiles: templates are public; cluster IPs stay local.
+!profiles/*/.env
+!profiles/*/profile.env
+profiles/*/.env.local
+.profile-state
+/.worktrees/
+*.bak-*
