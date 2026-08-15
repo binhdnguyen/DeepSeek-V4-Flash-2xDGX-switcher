@@ -30,6 +30,14 @@ services:
       # copies over the image's copy. The stock image encoder already dispatches
       # on type correctly, so mounting it here would only log a WARN every boot.
       - ${DSPARK_NVFP4_ISSUE22_HOTFIX:-./patches/hotfix-nvfp4-ds-mla-issue22.sh}:/opt/hotfix-nvfp4-ds-mla-issue22.sh:ro
+      # vLLM 0.27 DSV4 perf backports (upstream, commit titled "Backport six vLLM 0.27 DSV4 perf hotfixes to 0.1.1 image" — cite by title, NOT SHA: upstream force-pushes main): now ten idempotent hotfixes — .sh anchor-patchers plus the .py file-patchers upstream added 2026-08-13,
+      # run from the command below BEFORE vLLM is imported — same reasoning as the
+      # Issue #22 mount above, and the reason we do NOT use upstream's
+      # apply-then-restart path (that costs a second weight load per rank).
+      # Mounted as a directory so adding a seventh script needs no compose change.
+      # Rank 1 gets its own copy via the start script's patches/ sync; without it
+      # docker would mount an empty dir here and the worker would run unpatched.
+      - ${DSPARK_DSV4_HOTFIX_DIR:-./patches}:/opt/dsv4-hotfixes:ro
       - ${DSPARK_TMP_HOST:-${HOME}/.cache/dspark-tmp}:/tmp
 
     environment:
@@ -53,7 +61,26 @@ services:
       # 1 = do not apply the Issue #22 nvfp4_ds_mla decode hotfix.
       DSPARK_SKIP_HOTFIX: "${DSPARK_SKIP_HOTFIX:-0}"
 
+      # 1 = do not apply the six vLLM 0.27 DSV4 perf backports.
+      # NOTE on naming: upstream overloads DSPARK_SKIP_HOTFIX to mean "skip the
+      # v0.27 backports" and uses DSPARK_SKIP_ISSUE22_HOTFIX for Issue #22. Here
+      # DSPARK_SKIP_HOTFIX already meant Issue #22 (above) long before the
+      # backports existed, so the new knob gets its own name rather than silently
+      # changing what an existing variable does. Watch for this when syncing
+      # upstream's start script.
+      DSPARK_SKIP_DSV4_027_HOTFIX: "${DSPARK_SKIP_DSV4_027_HOTFIX:-0}"
+
       VLLM_USE_FLASHINFER_SAMPLER: "${VLLM_USE_FLASHINFER_SAMPLER:-1}"
+
+      # Issue #26: sparsify SWA (DSpark draft/indexer) prefix-cache checkpoints to
+      # one tail per N-token segment + the replay boundary, so dense SWA tails stop
+      # evicting MLA prefix blocks. MUST be a multiple of 256 (scheduler block size);
+      # empty is NOT supported via compose default. Pairs with
+      # patches/hotfix-dsv4-issue26-hybrid-swa-min.py, which stops an SWA window hit
+      # from zeroing the MLA common hit. Measured here 2026-08-12 (pre-fix): a 54.8k
+      # prefix-cache hit took 5.18s while 109k/219k hits took 0.57s/0.86s — the kind
+      # of inverted result this pair is meant to remove.
+      VLLM_PREFIX_CACHE_RETENTION_INTERVAL: "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-4096}"
 
       VLLM_USE_B12X_MOE: "${VLLM_USE_B12X_MOE:-1}"
       VLLM_USE_B12X_WO_PROJECTION: "${VLLM_USE_B12X_WO_PROJECTION:-1}"
@@ -118,6 +145,7 @@ services:
         export CUDAToolkit_ROOT="$${CUDAToolkit_ROOT:-$${CUDA_HOME}}";
         export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$${LD_LIBRARY_PATH:-}";
         if [ "$${DSPARK_SKIP_HOTFIX:-0}" != "1" ] && [ -f /opt/hotfix-nvfp4-ds-mla-issue22.sh ]; then bash /opt/hotfix-nvfp4-ds-mla-issue22.sh || echo "WARN: Issue #22 hotfix did not apply" >&2; fi;
+        if [ "$${DSPARK_SKIP_DSV4_027_HOTFIX:-0}" != "1" ] && [ -d /opt/dsv4-hotfixes ]; then n=0; for h in /opt/dsv4-hotfixes/hotfix-dsv4-*.sh; do [ -f "$$h" ] || continue; n=$$((n+1)); bash "$$h" >/dev/null 2>&1 || echo "WARN: $$(basename $$h) did not apply" >&2; bash "$$h" --status 2>&1 | grep -q "NOT APPLIED" && echo "WARN: $$(basename $$h) reports NOT APPLIED after run" >&2; done; for p in /opt/dsv4-hotfixes/hotfix-dsv4-*.py; do [ -f "$$p" ] || continue; n=$$((n+1)); python3 "$$p" >/dev/null 2>&1 || echo "WARN: $$(basename $$p) did not apply - anchor missing, it refuses rather than corrupt" >&2; done; echo "DSV4 hotfixes applied: $$n"; [ "$$n" -eq 0 ] && echo "WARN: no hotfix-dsv4-* in /opt/dsv4-hotfixes - THIS RANK IS UNPATCHED (worker patches/ sync missing?)" >&2; fi;
         VLLM_QUANTIZATION_ARGS="";
         if [ "$${ENABLE_VLLM_GB10_PATCH:-0}" = "1" ]; then
           python3 -m pip install -e /opt/vllm-gb10-hybrid-nvfp4 --no-deps;
@@ -138,6 +166,7 @@ services:
         --max-model-len ${MAX_MODEL_LEN:-1048576}
         --max-num-seqs ${MAX_NUM_SEQS:-6}
         --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-8192}
+        --long-prefill-token-threshold ${LONG_PREFILL_TOKEN_THRESHOLD:-1024}
         --max-cudagraph-capture-size $$(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-3} + 1) ))
         --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.80}
         --enable-prefix-caching
