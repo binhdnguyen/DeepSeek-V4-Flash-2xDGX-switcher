@@ -5,12 +5,22 @@ repository root.
 
 ## Profiles
 
-| Profile | Runtime / checkpoint | Served model |
-|---|---|---|
-| `0731` | Anemll Compose runtime, `deepseek-ai/DeepSeek-V4-Flash-0731` | `deepseek-v4-flash-0731` |
-| `dspark` | Anemll Compose runtime, original DSpark checkpoint | `deepseek-v4-flash-dspark` |
+| Profile | Checkpoint | Served id | Thinking | K | Seqs / util |
+|---|---|---|---|---|---|
+| `dspark` | `deepseek-ai/DeepSeek-V4-Flash-DSpark` @ `62af8fffb2` | `deepseek-v4-flash-dspark` only | hardcoded off | 3 | 16 / 0.8 |
+| `0731` | `deepseek-ai/DeepSeek-V4-Flash-0731` @ `9e165c30` | `deepseek-v4-flash-0731` only | MiaAI `max` | 5 | 6 / 0.835 text |
+| `0731-ablit` | Keys `…-Abliterated-32-32` @ `6c47916f` | `deepseek-v4-flash-0731-ablit` only | MiaAI `max` | 5 | 6 / 0.835 text |
 
-`0731` is the default lane. Toggle order is `0731 -> dspark -> 0731`.
+`dspark` is the production translation default. Toggle order is discovered
+from `profiles/` (`0731` → `0731-ablit` → `dspark`). Do not leave 0731 loaded
+unless asked. Clients stay on broker `:8879` / `local-auto` (8888 then 8880)
+and must use the active lane's served id.
+
+Repo root is the current MiaAI `main` 0731 recipe. `profiles/dspark/` is a
+sealed think-off compose. `0731` / `0731-ablit` restore that root compose
+and only swap env (`ABLITERATED=0` vs `1`).
+
+Operational checkout: `~/ai/DeepSeek-V4-Flash-2xDGX-switcher`.
 
 Profiles are **discovered from the `profiles/` directory** — any directory
 containing a `profile.env` is a profile — so adding or removing one needs no
