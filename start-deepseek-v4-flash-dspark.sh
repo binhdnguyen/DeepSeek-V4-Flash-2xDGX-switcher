@@ -419,7 +419,7 @@ print_resolved_profile() {
   fi
   echo "  image: $DSPARK_VLLM_IMAGE"
   echo "  model: ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}"
-  echo "  served model: ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"
+  echo "  served model: ${SERVED_MODEL_NAME:-deepseek-v4-flash-0731}"
   echo "  max model len: ${MAX_MODEL_LEN:-1000000}"
   echo "  max num seqs: ${MAX_NUM_SEQS:-12}"
   echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS:-8192}"
@@ -683,7 +683,7 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
     echo "Running minimal OpenAI-compatible thinking-budget chat request..."
     curl -fsS --max-time 60 "$CHAT_URL" \
       -H "Content-Type: application/json" \
-      -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":32,"temperature":0.6,"top_p":0.95,"thinking_token_budget":1,"chat_template_kwargs":{"thinking":true,"reasoning_effort":"low"}}' >/dev/null
+      -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-0731}"'","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":32,"temperature":0.6,"top_p":0.95,"thinking_token_budget":1,"chat_template_kwargs":{"thinking":true,"reasoning_effort":"low"}}' >/dev/null
     echo "Minimal thinking-budget chat request succeeded."
     exit 0
   fi

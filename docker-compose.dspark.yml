@@ -172,7 +172,7 @@ services:
         if [ -n "$${DSPARK_REVISION:-}" ]; then REVISION_ARGS="--revision $${DSPARK_REVISION}"; fi;
         exec /usr/local/bin/vllm serve ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}
         $${REVISION_ARGS}
-        --served-model-name ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}
+        --served-model-name ${SERVED_MODEL_NAME:-deepseek-v4-flash-0731}
         --host ${VLLM_HOST:-127.0.0.1}
         --port ${VLLM_PORT:-8888}
         --trust-remote-code
